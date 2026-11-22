@@ -36,7 +36,7 @@ export const badge = (label, style = "") => `<span class="badge ${style}">${e(la
 export const empty = (message, action = "") => `<div class="empty"><p>${e(message)}</p>${action}</div>`;
 export const field = (label,name,body) => `<div class="field"><label for="field-${name}">${e(label)}</label>${body}</div>`;
 export const textField = (label,name,value="",attrs="") => field(label,name,`<input id="field-${name}" name="${name}" value="${e(value)}" ${attrs}>`);
-export const numField = (label,name,value,min,max,step=1) => textField(label,name,value,`type="number" min="${min}" max="${max}" step="${step}"`);
+export const numField = (label,name,value,min,max,step=1,attrs="") => textField(label,name,value,`type="number" min="${min}" max="${max}" step="${step}" ${attrs}`);
 export const selectField = (label,name,choices) => field(label,name,`<select id="field-${name}" name="${name}">${choices}</select>`);
 export const areaField = (label,name,value="",limit=2000) => field(label,name,`<textarea id="field-${name}" name="${name}" maxlength="${limit}">${e(value)}</textarea>`);
 export const checkField = (label,name,checked=false) => `<label class="field check"><input type="checkbox" name="${name}"${checked ? " checked" : ""}> ${e(label)}</label>`;

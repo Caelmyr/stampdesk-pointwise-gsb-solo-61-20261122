@@ -5,8 +5,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 from scipy import ndimage
 
-from .model import InputError, MAX_REGISTERED_DIM, collection, numeric_pair, physical_scale
+from .model import InputError, MAX_REGISTERED_DIM, collection, numeric_pair
 from .photos import open_working, linear_to_srgb, srgb_to_linear
+from .rulers import frame_scale
 
 
 DEFAULT_CORNERS = [[0, 0], [1, 0], [1, 1], [0, 1]]
@@ -195,7 +196,7 @@ def specimen_frame(blobs, tile, photo_id=None):
     linear, valid, clipped = warp_capture(rgb, alpha, destination, transform)
     if np.count_nonzero(valid) < 64:
         raise InputError("The marked specimen plane contains too few usable pixels.")
-    return SampleFrame(linear, valid, photo, tuple(transform.ravel()), physical_scale(tile, *destination), clipped)
+    return SampleFrame(linear, valid, photo, tuple(transform.ravel()), frame_scale(tile, *destination), clipped)
 
 
 def active_region(tile, region_id):

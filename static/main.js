@@ -112,18 +112,66 @@ function captures() {
   return `<div class="grid-detail">${imagesForCapture()}${captureSide()}</div>`;
 }
 
+function rulerStatusLabel(check) {
+  if (!check) return "Not checked";
+  if (check.status==="fail") return "Out of tolerance · reference only";
+  if (check.status==="reference") return "Defines the cut card";
+  return check.within_tolerance?"Within tolerance":"Out of tolerance";
+}
+
+function rulerPanel(key,label,check) {
+  const style=check?.status==="fail"?"fail":check?.status==="reference"?"reference":"";
+  const detail=check
+    ? check.measured_mm==null
+      ? `<div class="ruler-value">Saved · unreadable</div><div class="ruler-note">The saved span no longer fits this plane. Mark it again.</div>`
+      : `<div class="ruler-value">${n(check.measured_mm,3)} mm measured</div>
+         <div class="ruler-note">Span ${n(check.span_mm,3)} mm · error ${check.error_mm>0?"+":""}${n(check.error_mm,3)} mm · ${e(rulerStatusLabel(check))}</div>`
+    : `<div class="ruler-value">No 10 mm span</div><div class="ruler-note">Mark this ruler and a paper area on its half of the plane.</div>`;
+  return `<div class="ruler-panel ${style}"><h4><span>${e(label)}</span>${badge(check?.status==="fail"?"fail":check?.status==="reference"?"reference":check?"ok":"none",check?.status==="fail"?"caution":check?.status==="reference"?"ready":"")}</h4>
+    ${detail}${check?.region_name?`<div class="ruler-note">Area: ${e(check.region_name)}</div>`:""}
+    <div class="ruler-strip">${btn(check?"Re-mark":"Mark span","ruler-check","tiny "+(check?"ghost":"secondary"),null,`data-side="${key}"`)}${check?btn("Remove","ruler-side-remove","tiny ghost",null,`data-side="${key}"`):""}</div></div>`;
+}
+
+function rulerCard() {
+  const rulers=state.tile.rulers;
+  const selected=rulers?.selected;
+  if (!selected) {
+    const saved=Boolean(rulers?.sides && Object.keys(rulers.sides).length);
+    const unreadable=key=>rulers?.sides?.[key]?{status:"fail",measured_mm:null,span_mm:10,error_mm:null}:null;
+    return `<section class="card"><h3>Rule and cut-card scale</h3>
+      <p class="soft">Mark each side's 10 mm ruler span and the paper area it checks. ${saved?`Saved checks cannot be reconciled: ${e(rulers.error||"mark the spans again.")}`:"The workbench then writes one horizontal scale to the cut card and reports the side error."}</p>
+      <div class="ruler-grid">${rulerPanel("left","Left ruler",unreadable("left"))}${rulerPanel("right","Right ruler",unreadable("right"))}</div>
+      <div class="actions">${btn("Clear ruler checks","rulers-clear","tiny ghost")}</div></section>`;
+  }
+  const summary=selected.mode==="shared"
+    ? `Both sides agree within ${n(selected.tolerance_mm,2)} mm. Cut card uses their shared horizontal scale.`
+    : selected.mode==="reference"
+      ? `Both sides cannot meet ${n(selected.tolerance_mm,2)} mm. ${selected.reference_side[0].toUpperCase()+selected.reference_side.slice(1)} side defines the cut card; crossed lengths on the ${selected.failing_side} side stay reference-only.`
+      : `Only the ${selected.reference_side} side is checked; it defines the cut card.`;
+  return `<section class="card"><h3>Rule and cut-card scale</h3>
+    <div class="metrics">${stat("Horizontal",n(selected.horizontal_mm_per_px,4)+" mm/px")}${stat("Vertical",n(selected.vertical_mm_per_px,4)+" mm/px")}${stat("Tolerance",n(selected.tolerance_mm,2)+" mm")}${stat("Boundary x",n(selected.boundary_x,3))}</div>
+    <p class="notice${selected.failing_side?" warn":""}">${e(summary)}</p>
+    <div class="ruler-grid">${rulerPanel("left","Left ruler",selected.checks.left)}${rulerPanel("right","Right ruler",selected.checks.right)}</div>
+    <div class="actions">${btn("Clear ruler checks","rulers-clear","tiny ghost")}</div>
+    <p class="soft">Vertical comes from ${e(selected.vertical_source.replace("_"," "))}.</p></section>`;
+}
+
+function neutralCard() {
+  const gains=state.tile.calibration;
+  return `<section class="card"><h3>Neutral-card balance</h3>${gains?`<div class="metrics">${stat("Measured card",gains.before_swatch)}${stat("Balanced card",gains.after_swatch)}${stat("Unclipped card pixels",n(gains.card_samples,0))}</div>`:"<p class='soft'>Use an evenly lit neutral patch to balance this base capture.</p>"}
+       <div class="actions">${btn("Balance neutral card","neutral","secondary","sample")}${gains?btn("Clear balance","neutral-clear","ghost"):""}</div>
+     </section>`;
+}
+
 function regionPage() {
   const tile=state.tile;
   const current=tile.photos.find(item=>item.registration_state==="base");
   const rows=tile.regions.map(item=>`<div class="row"><div class="grow"><strong class="row-title">${e(item.name)}</strong><small>${e(state.config.region_purposes[item.purpose])}</small></div>
     ${btn("Edit","region-edit","tiny secondary",null,`data-id="${item.id}"`)}</div>`).join("");
-  const gains=tile.calibration;
   return `<div class="grid-detail"><section class="card"><div class="title-row"><h3>Sampling plane</h3>${current?btn("Draw region","region-add","primary","plus"):""}</div>
      ${current?`<figure class="stage">${img(current.registered_url+"&layer=regions",`Marked regions on ${tile.name}`)}</figure><p class="stage-foot">Region positions are saved in the registered survey plane.</p>`:empty("Set a base photograph from Captures.")}</section>
      <div class="stack"><section class="card"><h3>Saved regions</h3>${rows?`<div class="divider-list">${rows}</div>`:"<p class='soft'>Draw an inspection area, a coverage reference, or a patch to exclude.</p>"}</section>
-     <section class="card"><h3>Neutral-card balance</h3>${gains?`<div class="metrics">${stat("Measured card",gains.before_swatch)}${stat("Balanced card",gains.after_swatch)}${stat("Unclipped card pixels",n(gains.card_samples,0))}</div>`:"<p class='soft'>Use an evenly lit neutral patch to balance this base capture.</p>"}
-       <div class="actions">${btn("Balance neutral card","neutral","secondary","sample")}${gains?btn("Clear balance","neutral-clear","ghost"):""}</div>
-     </section></div></div>`;
+     ${rulerCard()}${neutralCard()}</div></div>`;
 }
 
 function optionInput(key,item) {
@@ -166,6 +214,15 @@ function evidencePage() {
     <section class="card"><h3>Specimen activity</h3><div class="divider-list scroll-list">${(state.activity||[]).map(row=>`<div class="row"><div class="grow"><strong>${e(row.message)}</strong><br><small>${e(date(row.recorded_at))}</small></div></div>`).join("")}</div></section></div>`;
 }
 
+function traceRows(shape) {
+  const split=shape.ruler_split;
+  if (!split) return table(["Segment","Length","Heading"],shape.segments.map(item=>[item.index,`${n(item.length)} ${item.units}`,n(item.clockwise_heading)+"°"]));
+  return table(["Segment","Side","Measured","Toward cut","Heading"],split.segments.map(item=>[
+    `${item.source_index}.${item.part}`,item.side,`${n(item.length)} ${item.units}`,
+    item.counts_toward_cut?`${n(item.cumulative_cut)} ${item.units}`:"reference only",n(item.clockwise_heading)+"°",
+  ]));
+}
+
 function geometryPage() {
   const record=state.metrologyActive;
   const results=state.metrology||[];
@@ -174,14 +231,17 @@ function geometryPage() {
   if (record) {
     const metrics=record.shape;
     const base=`/api/metrology/${record.id}`;
+    const ruler=metrics.ruler_split;
     const stats=record.mode==="trace"
       ? [["Trace length",`${n(metrics.trace_length)} ${metrics.length_unit}`],["Supported stations",percent(metrics.overall_support)]]
       : [["Marked area",`${n(metrics.vector_outline_area)} ${metrics.units}`],["Visible area",`${n(metrics.raster_supported_area)} ${metrics.units}`],["Outline",`${n(metrics.outline_length)} ${metrics.outline_unit}`]];
+    if (ruler) stats.push(["Cuttable length",`${n(ruler.cut_length)} ${ruler.units}`],["Reference only",`${n(ruler.reference_length)} ${ruler.units}`]);
     const stations=record.mode==="trace"?metrics.segments:metrics.outline_segments;
     report=`<section class="card stack"><h3>${e(record.title)}</h3>
       <figure class="stage">${img(base+"/overlay.png",record.title)}</figure>
       <div class="metrics">${stats.map(([name,value])=>stat(name,value)).join("")}</div>
-      ${table(["Segment","Length","Heading"],stations.map(item=>[item.index,`${n(item.length)} ${item.units}`,n(item.clockwise_heading)+"°"]))}
+      ${ruler?`<p class="notice warn">The ${e(ruler.failing_side)} ruler is outside ${n(ruler.tolerance_mm,2)} mm. Lengths on that side of x=${n(ruler.boundary_x,3)} stay as reference and are left out of the cuttable total.</p>`:""}
+      ${record.mode==="trace"?traceRows(metrics):table(["Segment","Length","Heading"],stations.map(item=>[item.index,`${n(item.length)} ${item.units}`,n(item.clockwise_heading)+"°"]))}
       <div class="actions">${link("Measurement JSON",base+"/data.json","secondary","download")}</div></section>`;
   }
   return `<div class="grid-detail">${report}<div class="stack"><section class="card"><h3>Measure a visible shape</h3>
@@ -417,7 +477,7 @@ function geometryForm(mode) {
     <p class="notice">Mark the same four points clockwise, beginning at the upper-left survey corner. Clear the marks before drawing a new outline.</p>
     ${drawing(item.preview_url,"Photo to mark")}<div class="actions">${btn("Clear points","draw-clear","tiny secondary")}${btn("Undo point","draw-undo","tiny ghost")}
       ${btn("Preview alignment","geometry-preview","tiny secondary",null,`data-mode="${mode}" data-id="${item.id}"`)}<span class="soft" id="draw-count"></span></div>
-    ${saving?checkField("Reset existing regions and registrations if the plane changes","reset_regions",false):""}
+    ${saving?checkField("Reset existing regions, ruler checks and registrations if the plane changes","reset_regions",false):""}
     ${saving?checkField("Use entered specimen proportions","respect_scale",true):""}
     <div id="geometry-preview"></div>`,saving?"Save specimen plane":"Save registration",async data=>{
       if (drawPoints.length!==4) throw Error("Mark exactly four survey corners.");
@@ -430,6 +490,43 @@ function geometryForm(mode) {
       }
     },true);
   prepareDrawing(existing||[],4);
+}
+
+async function rulerForm(side) {
+  const base=state.tile.photos.find(item=>item.registration_state==="base");
+  if (!base) throw Error("Set a base capture before marking a ruler.");
+  const saved=state.tile.rulers?.sides?.[side]||null;
+  const label=side==="left"?"left":"right";
+  modal(`Mark the ${label} ruler check`,`
+    <p class="notice">Click the two ends of the printed 10 mm scale on the ${label} ruler, then click three or more corners around the paper area this ruler checks. The whole span stays on one side of the specimen.</p>
+    ${drawing(base.registered_url,`Specimen plane for the ${label} ruler`)}
+    <div class="actions">${btn("Clear points","draw-clear","tiny secondary")}${btn("Undo point","draw-undo","tiny ghost")}<span class="soft" id="draw-count"></span></div>
+    <div class="form-columns">${numField("Marked span mm","span_mm",saved?.span_mm??10,0.1,10000,0.1)}${numField("Allowed error mm","tolerance_mm",state.tile.rulers?.tolerance_mm??0.2,0.001,10,0.001)}</div>
+    <p class="soft">The first two marks are the ruler endpoints; every further mark is a corner of the checked paper area.</p>`,
+    "Save ruler check",async data=>{
+      if (drawPoints.length<5) throw Error("Mark the two ruler ends and at least three area corners.");
+      const segment=drawPoints.slice(0,2);
+      const vertices=drawPoints.slice(2);
+      const [a,b]=segment;
+      const spanPx=Math.hypot((b[0]-a[0])*state.tile.plane.size[0],(b[1]-a[1])*state.tile.plane.size[1]);
+      if (spanPx<8) throw Error("Mark the two ruler ends at least eight registered pixels apart.");
+      const body={sides:{[side]:{segment,vertices,span_mm:Number(data.get("span_mm")),region_name:`${label[0].toUpperCase()+label.slice(1)} ruler paper area`}},tolerance_mm:Number(data.get("tolerance_mm"))};
+      await patchTile("/rulers","PUT",body,`${label[0].toUpperCase()+label.slice(1)} ruler check saved.`);
+    },true);
+  let previous=[];
+  if (saved) {
+    try {
+      const detail=await api(tileUrl());
+      previous=[...(detail.rulers?.sides?.[side]?.segment||[]),...(detail.rulers?.sides?.[side]?.region?.vertices||[])];
+    } catch { previous=[]; }
+  }
+  prepareDrawing(previous,40);
+}
+
+function rulerSideRemove(side) {
+  modal("Remove this ruler check?",'<p>The other side remains available. Saved Geometry records keep their measured lengths.</p>',"Remove check",async ()=>{
+    await patchTile("/rulers/"+side,"DELETE",{},`${side[0].toUpperCase()+side.slice(1)} ruler check removed.`);
+  });
 }
 
 function regionForm(region) {
@@ -692,6 +789,11 @@ async function doAction(name,target) {
     quality:qualityForm,
     "region-add":()=>regionForm(),
     "region-edit":()=>regionForm(state.tile.regions.find(item=>item.id===id)),
+    "ruler-check":()=>rulerForm(target.dataset.side),
+    "ruler-side-remove":()=>rulerSideRemove(target.dataset.side),
+    "rulers-clear":()=>modal("Clear all ruler checks?",'<p>The cut card falls back to the entered specimen dimensions. Saved Geometry records keep their measured lengths.</p>',"Clear checks",async ()=>{
+      await patchTile("/rulers","DELETE",{},"Ruler checks cleared.");
+    }),
     "region-remove":()=>modal("Remove sampling region?",'<p>Saved measurements retain their snapshot of this region.</p>',"Remove region",async ()=>{
       await patchTile("/regions/"+id,"DELETE",{},"Sampling region removed.");
     }),

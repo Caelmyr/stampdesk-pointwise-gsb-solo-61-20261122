@@ -8,12 +8,15 @@ from .analysis import capture_provenance, specimen_provenance
 from .art import ACCENT, INK, SHADOW, base_rgba, curve_points, stored_preview
 from .geometry import active_region, polygon_mask, region_domain, signed_area, specimen_frame, validate_polygon
 from .model import InputError, collection, dictionary, enumeration, identity, numeric_pair, string
+from .rulers import ruler_split
 
 
 MIN_SEGMENT = 2.0
 MIN_MARK_PIXELS = 20
 REGION_OUTLINE = (199, 212, 151)
 EXCLUDED_OUTLINE = (237, 122, 110)
+REFERENCE_OUTLINE = (245, 176, 92)
+REFERENCE_FILL = (245, 176, 92, 30)
 MASK_THROUGH = (102, 180, 147, 94)
 
 
@@ -178,7 +181,109 @@ def mask_geometry(frame, selected, requested, supported):
     }
 
 
-def geometry_painter(frame, points, segments, closed=False, support=None, centroid=None):
+def split_trace_segments(frame, points, split):
+    """Split a traced path where it crosses the ruler boundary.
+
+    Pieces on the side whose ruler could not meet the tolerance keep their
+    measured length as a reference value but do not enter the cuttable total.
+    """
+    factors, units = calibrated_dimensions(frame)
+    vertices = np.asarray(points, dtype=np.float64)
+    pixels = vertices * frame.extent
+    physical = vertices * factors
+    boundary = float(split["boundary_x"])
+    failing = split["failing_side"]
+    pieces = []
+    cut_total = 0.0
+    all_total = 0.0
+    for index, (start, stop, start_px, stop_px) in enumerate(zip(physical, physical[1:], pixels, pixels[1:]), 1):
+        delta = stop - start
+        length = float(np.linalg.norm(delta))
+        heading = round(math.degrees(math.atan2(delta[1], delta[0])) % 360, 3)
+        first, last = vertices[index - 1], vertices[index]
+        cuts = [0.0, 1.0]
+        if first[0] != last[0] and min(first[0], last[0]) < boundary < max(first[0], last[0]):
+            cuts.append((boundary - first[0]) / (last[0] - first[0]))
+        cuts = sorted(set(round(value, 12) for value in cuts))
+        for part, (start_fraction, stop_fraction) in enumerate(zip(cuts, cuts[1:]), 1):
+            if stop_fraction <= start_fraction:
+                continue
+            middle_x = first[0] + (last[0] - first[0]) * (start_fraction + stop_fraction) / 2
+            side = "right" if middle_x > boundary else "left"
+            counts = side != failing
+            piece_length = length * (stop_fraction - start_fraction)
+            all_total += piece_length
+            if counts:
+                cut_total += piece_length
+            pieces.append({
+                "index": len(pieces) + 1,
+                "source_index": index,
+                "part": part,
+                "parts": len(cuts) - 1,
+                "length": round(piece_length, 5),
+                "units": units,
+                "dx": round(float(delta[0]) * (stop_fraction - start_fraction), 5),
+                "dy": round(float(delta[1]) * (stop_fraction - start_fraction), 5),
+                "clockwise_heading": heading,
+                "side": side,
+                "counts_toward_cut": counts,
+                "reference_only": not counts,
+                "start": np.round(first + (last - first) * start_fraction, 6).tolist(),
+                "end": np.round(first + (last - first) * stop_fraction, 6).tolist(),
+                "start_px": np.round(start_px + (stop_px - start_px) * start_fraction, 3).tolist(),
+                "end_px": np.round(start_px + (stop_px - start_px) * stop_fraction, 3).tolist(),
+                "cumulative_all": round(all_total, 5),
+                "cumulative_cut": round(cut_total, 5),
+            })
+    return {
+        **split,
+        "segments": pieces,
+        "cut_length": round(cut_total, 5),
+        "reference_length": round(all_total - cut_total, 5),
+        "measured_length": round(all_total, 5),
+        "units": units,
+    }
+
+
+def draw_ruler_marks(image, split):
+    """Tint the failing ruler half and draw both checked spans on the overlay."""
+    from PIL import Image
+
+    width, height = image.size
+    boundary = min(max(split["boundary_x"], 0.0), 1.0) * width
+    failing = split["failing_side"]
+    left_edge, right_edge = (0, boundary) if failing == "left" else (boundary, width)
+    tint = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ImageDraw.Draw(tint).rectangle(
+        (int(round(left_edge)), 0, int(round(right_edge)) - 1, height - 1),
+        fill=REFERENCE_FILL,
+    )
+    image = Image.alpha_composite(image.convert("RGBA"), tint)
+    draw = ImageDraw.Draw(image)
+    stroke = max(1, round(min(width, height) / 310))
+    draw.line([(boundary, 0), (boundary, height)], fill=REFERENCE_OUTLINE, width=stroke)
+    for side, check in split["checks"].items():
+        points = [tuple(np.asarray(point, dtype=np.float64) * [width, height]) for point in check["segment"]]
+        region = check.get("region_vertices")
+        if region:
+            outline = curve_points([*region, region[0]], (width, height))
+            draw.line(outline, fill=REFERENCE_OUTLINE if side == failing else REGION_OUTLINE, width=stroke)
+        draw.line(points, fill=REFERENCE_OUTLINE if side == failing else ACCENT, width=stroke + 2)
+        for x, y in points:
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=INK, outline=SHADOW, width=1)
+        x, y = points[0]
+        draw.text(
+            (x + 5, y + 5),
+            f"{side} {check['measured_mm']:.2f} mm ({check['error_mm']:+.2f})",
+            fill=INK,
+            stroke_width=2,
+            stroke_fill=SHADOW,
+        )
+    draw.text((boundary + 4, 6), f"{failing} side · reference only", fill=INK, stroke_width=2, stroke_fill=SHADOW)
+    return image
+
+
+def geometry_painter(frame, points, segments, closed=False, support=None, centroid=None, split=None):
     image = base_rgba(frame)
     width, height = image.size
     pixels = curve_points(points, image.size)
@@ -192,11 +297,23 @@ def geometry_painter(frame, points, segments, closed=False, support=None, centro
     stroke = max(1, round(min(width, height) / 310))
     draw.line(edges, fill=SHADOW, width=stroke + 3, joint="curve")
     draw.line(edges, fill=REGION_OUTLINE if closed else ACCENT, width=stroke + 1, joint="curve")
+    if split is not None:
+        for piece in split["segments"]:
+            if piece["reference_only"]:
+                draw.line([tuple(piece["start_px"]), tuple(piece["end_px"])], fill=REFERENCE_OUTLINE, width=stroke + 1)
+        cut_by_source = {}
+        for piece in split["segments"]:
+            entry = cut_by_source.setdefault(piece["source_index"], [0.0, False])
+            entry[0] += piece["length"] if piece["counts_toward_cut"] else 0.0
+            entry[1] = entry[1] or piece["reference_only"]
     for index, (point_a, point_b) in enumerate(zip(edges, edges[1:])):
         x = (point_a[0] + point_b[0]) / 2
         y = (point_a[1] + point_b[1]) / 2
         line = segments[index]
         label = f"{line['length']:.2f} {line['units']}"
+        if split is not None and index + 1 in cut_by_source:
+            cut, partial = cut_by_source[index + 1]
+            label += f" · reference only" if partial and cut == 0 else f" · cut {cut:.2f}"
         draw.text((x + 4, y - 9), label, fill=INK, stroke_width=2, stroke_fill=SHADOW)
     for index, (x, y) in enumerate(pixels, 1):
         draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=INK, outline=SHADOW, width=1)
@@ -208,7 +325,7 @@ def geometry_painter(frame, points, segments, closed=False, support=None, centro
     return image
 
 
-def trace_geometry(frame, available, points):
+def trace_geometry(frame, available, points, split=None):
     segments, units = path_segments(frame, points)
     cumulative = path_cumulative(segments)
     pieces = sample_support_along(available, frame, points)
@@ -224,7 +341,15 @@ def trace_geometry(frame, available, points):
         "overall_support": round(100 * present / samples, 3),
         "length_unit": units,
     }
-    return detail, geometry_painter(frame, points, segments)
+    divided = split_trace_segments(frame, points, split) if split else None
+    image = geometry_painter(frame, points, segments, split=divided)
+    if divided is not None:
+        image = draw_ruler_marks(image, divided)
+        detail["ruler_split"] = divided
+        detail["cut_length"] = divided["cut_length"]
+        detail["reference_length"] = divided["reference_length"]
+        detail["cut_length_unit"] = divided["units"]
+    return detail, image
 
 
 def polygon_geometry(tile, frame, selection, available):
@@ -256,7 +381,7 @@ def create_metrology(store, specimen_id, payload):
     available = region_domain(frame.extent, tile) & frame.valid
     if mode == "trace":
         points = path_points(data.get("points"))
-        shape, overlay = trace_geometry(frame, available, points)
+        shape, overlay = trace_geometry(frame, available, points, ruler_split(tile))
         region = None
     else:
         region = active_region(tile, identity(data.get("region_id"), "Region ID"))

@@ -49,6 +49,7 @@ from .study import create_study, public_metrics
 from .workspace import (
     calibrate,
     clear_calibration,
+    clear_rulers,
     edit_photo,
     edit_specimen,
     import_photo,
@@ -56,9 +57,11 @@ from .workspace import (
     preview_transform,
     remove_photo,
     remove_region,
+    remove_ruler_side,
     save_plane,
     save_region,
     save_registration,
+    save_rulers,
     summarize_tile,
 )
 
@@ -232,6 +235,20 @@ def register_specimens(api, store, heavy):
     @api.delete("/specimens/<specimen_id>/calibration")
     def calibration_remove(specimen_id):
         return jsonify(present_tile(clear_calibration(store, specimen_id, json_request())))
+
+    @api.put("/specimens/<specimen_id>/rulers")
+    def rulers_save(specimen_id):
+        with heavy:
+            entry = save_rulers(store, specimen_id, json_request())
+        return jsonify(present_tile(entry))
+
+    @api.delete("/specimens/<specimen_id>/rulers")
+    def rulers_remove(specimen_id):
+        return jsonify(present_tile(clear_rulers(store, specimen_id, json_request())))
+
+    @api.delete("/specimens/<specimen_id>/rulers/<side>")
+    def ruler_side_remove(specimen_id, side):
+        return jsonify(present_tile(remove_ruler_side(store, specimen_id, side, json_request())))
 
 
 def register_measurements(api, store, heavy):

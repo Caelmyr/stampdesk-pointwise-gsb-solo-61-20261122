@@ -26,7 +26,8 @@ from .model import (
     tile_fields,
 )
 from .photos import diagnostic_flags, store_capture
-from .store import make_id
+from .rulers import current_rulers, ruler_payload
+from .store import make_id, timestamp
 
 
 def describe_photo(photo, plane, registrations):
@@ -56,6 +57,7 @@ def summarize_tile(tile):
         "region_count": len(tile["regions"]),
         "cover_url": f"/api/specimens/{tile['id']}/photos/{cover['id']}/thumbnail" if cover else None,
         "registered_count": int(bool(base)) + len(tile["registrations"]),
+        "ruler_checked": bool(tile.get("rulers")),
         "updated_at": tile["updated_at"],
     }
 
@@ -76,6 +78,7 @@ def present_tile(tile):
         **tile,
         "photos": photos,
         "canvas_size": native["size"] if native else None,
+        "rulers": current_rulers(tile),
     }
 
 
@@ -193,10 +196,15 @@ def save_plane(store, tile_id, payload):
             return
         if (tile["registrations"] or tile["regions"]) and not reset:
             raise ConflictError("Changing the specimen plane requires confirming reset of its live regions and registrations.")
+        if tile.get("rulers") and not reset:
+            raise ConflictError(
+                "Changing the specimen plane requires resetting its saved ruler checks as well as its regions."
+            )
         tile["plane"] = updated
         tile["registrations"].clear()
         tile["regions"].clear()
         tile["calibration"] = None
+        tile["rulers"] = None
 
     return store.edit_tile(tile_id, expected, change, "plane", "Saved the photographed tile plane")
 
@@ -291,3 +299,54 @@ def clear_calibration(store, identifier, payload):
         tile["calibration"] = None
 
     return store.edit_tile(identifier, expected, change, "calibration", "Cleared neutral-card image gains")
+
+
+def save_rulers(store, identifier, payload):
+    expected = model_version(payload)
+    before = store.tile(identifier)
+    if before.get("plane") is None:
+        raise InputError("Set the specimen plane before saving ruler checks.")
+    previous = before.get("rulers") or {}
+    config = ruler_payload(payload, before, previous)
+    if not config["sides"]:
+        raise InputError("Mark a ten-millimetre span for at least one horizontal ruler.")
+    config["saved_at"] = timestamp()
+    probe = {**before, "rulers": config}
+    # Reconcile once against the current plane so a bad span is refused before it is stored.
+    current = current_rulers(probe)
+    if current["selected"] is None:
+        raise InputError(current["error"] or "The ruler checks cannot define a stable cut-card scale.")
+    state = current["selected"]
+
+    def change(tile):
+        # Keep the sampling plane, regions and geometry records that are already in use.
+        tile["rulers"] = config
+
+    message = "Saved ruler checks"
+    if state["failing_side"]:
+        message = f"Saved ruler checks; {state['failing_side']} side kept for reference only"
+    return store.edit_tile(identifier, expected, change, "calibration", message)
+
+
+def clear_rulers(store, identifier, payload):
+    expected = model_version(payload)
+
+    def change(tile):
+        tile["rulers"] = None
+
+    return store.edit_tile(identifier, expected, change, "calibration", "Cleared ruler checks")
+
+
+def remove_ruler_side(store, identifier, side, payload):
+    expected = model_version(payload)
+    side = enumeration(side, ("left", "right"), "Ruler side")
+
+    def change(tile):
+        config = tile.get("rulers")
+        if not config:
+            return
+        config.get("sides", {}).pop(side, None)
+        if not config.get("sides"):
+            tile["rulers"] = None
+
+    return store.edit_tile(identifier, expected, change, "calibration", f"Removed the {side} ruler check")
