@@ -314,8 +314,10 @@ def register_artifacts(api, store, heavy):
     @api.post("/specimens/<specimen_id>/evidence")
     def packet_save(specimen_id):
         with heavy:
-            item = create_evidence(store, specimen_id, json_request())
-        return jsonify(summarize_evidence(item)), 201
+            item, packed = create_evidence(store, specimen_id, json_request())
+        summary = summarize_evidence(item)
+        summary["archive_bytes"] = packed
+        return jsonify(summary), 201
 
     @api.get("/evidence/<packet_id>")
     def packet_info(packet_id):

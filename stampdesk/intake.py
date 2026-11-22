@@ -6,12 +6,11 @@ from zipfile import BadZipFile, ZipFile
 
 from PIL import Image, UnidentifiedImageError
 
-from .evidence import result_entry_names
-from .model import ANALYSIS_LABELS, InputError, digest_identity, identity, integer, string
+from .evidence import MAX_ARCHIVE_BYTES, result_entry_names
+from .model import ANALYSIS_LABELS, InputError, digest_identity, enumeration, identity, integer, string
 from .photos import bounded_preview, png_bytes
 
 
-MAX_ARCHIVE_BYTES = 24 * 1024 * 1024
 MAX_EXAMINED_BYTES = 72 * 1024 * 1024
 MAX_MEMBERS = 130
 MAX_MEMBER_BYTES = 24 * 1024 * 1024
@@ -168,28 +167,91 @@ def measurement_descriptor(entry, expected_tile):
     return record_id, kind, label
 
 
-def trusted_provenance(record, expected_id):
+def declared_sources(record, attached):
+    raw = record.get("sources")
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 2:
+        raise InputError("An evidence measurement has an invalid source list.")
+    declared = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise InputError("An evidence measurement source is incomplete.")
+        digest = digest_identity(item.get("digest"))
+        photo_id = identity(item.get("photo_id"), "Photo ID")
+        if photo_id in declared:
+            raise InputError("An evidence measurement repeats a source photograph.")
+        attachment = enumeration(item.get("attachment"), ("included", "omitted"), "Source attachment")
+        if (attachment == "included") != (digest in attached):
+            raise InputError("A declared source photograph contradicts the packet originals.")
+        size = item.get("bytes")
+        declared[photo_id] = {
+            "digest": digest,
+            "name": string(item.get("name"), "Source name", maximum=140),
+            "role": string(item.get("role"), "Source role", maximum=32),
+            "bytes": integer(size, "Source bytes", lower=0, upper=MAX_MEMBER_BYTES) if size is not None else None,
+            "mime": string(item.get("mime"), "Source type", maximum=80, required=False) or None,
+            "attachment": attachment,
+        }
+    return declared
+
+
+def provenance_captures(record, expected_tile):
     provenance = record.get("provenance")
     if not isinstance(provenance, dict) or not isinstance(provenance.get("specimen"), dict):
         raise InputError("A measurement lacks specimen provenance.")
-    source = provenance["specimen"]
-    if source.get("id") != expected_id:
+    if provenance["specimen"].get("id") != expected_tile:
         raise InputError("Measurement provenance points to a different specimen.")
-    photo = provenance.get("photo")
-    if not isinstance(photo, dict):
+    captures = []
+    for photo in (provenance.get("photo"), provenance.get("paired_photo")):
+        if photo is None:
+            continue
+        if not isinstance(photo, dict):
+            raise InputError("A measurement lacks capture provenance.")
+        captures.append({
+            "photo_id": identity(photo.get("id"), "Photo ID"),
+            "name": string(photo.get("display_name"), "Capture name", maximum=140),
+            "role": string(photo.get("role"), "Capture role", maximum=32),
+            "source_digest": digest_identity(photo.get("original_digest"), "Original photograph digest"),
+            "working_digest": digest_identity(photo.get("working_digest"), "Working image digest"),
+        })
+    if not captures:
         raise InputError("A measurement lacks capture provenance.")
-    return {
-        "name": string(photo.get("display_name"), "Capture name", maximum=140),
-        "role": string(photo.get("role"), "Capture role", maximum=32),
-        "source_digest": digest_identity(photo.get("original_digest"), "Original photograph digest"),
-        "working_digest": digest_identity(photo.get("working_digest"), "Working image digest"),
-        "source_version": integer(record.get("source_version"), "Source revision", lower=1, upper=2_000_000_000),
-    }
+    return captures
 
 
-def import_measurements(store, archive, names, records, specimen):
+def capture_states(record, captures, attached):
+    declared = declared_sources(record, attached)
+    if declared is not None and set(declared) != {item["photo_id"] for item in captures}:
+        raise InputError("Declared source photographs do not match the measurement provenance.")
+    states = []
+    for capture in captures:
+        digest = capture["source_digest"]
+        if declared is None:
+            original = attached.get(digest)
+            states.append({
+                **capture,
+                "status": "verified" if original else "not_attached",
+                "bytes": original["bytes"] if original else None,
+                "mime": None,
+            })
+            continue
+        entry = declared[capture["photo_id"]]
+        if entry["digest"] != digest:
+            raise InputError("A declared source photograph does not match the measurement provenance.")
+        states.append({
+            **capture,
+            "status": "verified" if entry["attachment"] == "included" else "summary",
+            "bytes": entry["bytes"],
+            "mime": entry["mime"],
+        })
+    return states
+
+
+def import_measurements(store, archive, names, records, specimen, originals):
     if not isinstance(records, list) or not 1 <= len(records) <= 12:
         raise InputError("Evidence needs between 1 and 12 measurement records.")
+    attached = {item["digest"]: item for item in originals}
     collected = []
     seen = set()
     for record in records:
@@ -211,13 +273,16 @@ def import_measurements(store, archive, names, records, specimen):
                 continue
             data = member_digest(archive, names, stem + f"-{layer}.png", digest)
             images[layer] = store.blobs.put(decoded_panel(data, f"{label} {layer}"))
-        provenance = trusted_provenance(record, specimen)
+        captures = capture_states(record, provenance_captures(record, specimen), attached)
+        revision = integer(record.get("source_version"), "Source revision", lower=1, upper=2_000_000_000)
+        primary = captures[0]
         collected.append({
             "id": identifier,
             "label": label,
             "kind": kind,
-            "source_version": provenance["source_version"],
-            "capture": provenance,
+            "source_version": revision,
+            "capture": {key: primary[key] for key in ("name", "role", "source_digest", "working_digest")},
+            "captures": captures,
             "pictures": images,
         })
     return collected
@@ -242,7 +307,7 @@ def viewable_packet(store, archive):
     caption = string(manifest.get("title"), "Evidence title", maximum=115)
     notes = string(manifest.get("notes"), "Evidence notes", maximum=2400, required=False)
     original_images = read_originals(archive, entries, manifest.get("originals", []))
-    measurements = import_measurements(store, archive, entries, manifest.get("measurements"), tile_id)
+    measurements = import_measurements(store, archive, entries, manifest.get("measurements"), tile_id, original_images)
     sheets = import_sheets(store, archive, entries, manifest.get("sheets"))
     revision = integer(manifest.get("tile_version_at_pin"), "Specimen revision", lower=1, upper=2_000_000_000)
     return {

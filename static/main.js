@@ -161,7 +161,7 @@ function measurements() {
 
 function evidencePage() {
   return `<div class="grid-detail"><section class="card"><div class="title-row"><h3>Pinned evidence</h3>${btn("Pin evidence","pin","primary","archive")}</div>
-    ${state.packets.length?`<div class="divider-list">${state.packets.map(item=>`<div class="row"><div class="grow"><strong class="row-title">${e(item.title)}</strong><small>${item.count} measurements · ${e(date(item.created_at))}</small></div>
+    ${state.packets.length?`<div class="divider-list">${state.packets.map(item=>`<div class="row"><div class="grow"><strong class="row-title">${e(item.title)}</strong><small>${item.count} measurements · ${e(date(item.created_at))}${item.sources_total?` · originals ${item.sources_attached}/${item.sources_total}`:item.originals?` · ${item.originals} original${item.originals===1?"":"s"}`:""}</small></div>
     ${link("View report",`/api/evidence/${item.id}/inspection.html`,"tiny secondary","book")}${link("ZIP",`/api/evidence/${item.id}/archive.zip`,"tiny secondary","download")}</div>`).join("")}</div>`:empty("Pin a packet from saved measurements to keep a dated copy of the observations.")}</section>
     <section class="card"><h3>Specimen activity</h3><div class="divider-list scroll-list">${(state.activity||[]).map(row=>`<div class="row"><div class="grow"><strong>${e(row.message)}</strong><br><small>${e(date(row.recorded_at))}</small></div></div>`).join("")}</div></section></div>`;
 }
@@ -197,11 +197,24 @@ function receivedPage() {
   let view=empty("Open an inspection ZIP to check its declared images and specimen details.",actions);
   if (chosen) {
     const path=`/api/received/${chosen.id}`;
+    const statusText={verified:"Original verified",summary:"Summary only",not_attached:"Not attached"};
+    const captureRows=chosen.measurements.flatMap(item=>{
+      const caps=item.captures||[{...item.capture,status:null,bytes:null}];
+      return caps.map((cap,index)=>[
+        index?"":item.label,
+        cap.name,
+        cap.role,
+        `${(cap.source_digest||"").slice(0,12)}…`,
+        cap.bytes==null?"—":n(cap.bytes,0),
+        statusText[cap.status]||"—",
+      ]);
+    });
     view=`<section class="card stack"><div class="title-row"><h3>${e(chosen.title)}</h3>${badge("Digests match","ready")}</div>
       <p>${e(chosen.specimen)} · revision ${chosen.specimen_revision}</p>
       ${chosen.notes?`<p class="notice">${e(chosen.notes)}</p>`:""}
       ${chosen.sheets.map((item,index)=>img(path+`/sheet/${index+1}`,`Received evidence sheet ${index+1}`)).join("")}
-      ${table(["Measurement","Source capture","Version"],chosen.measurements.map(item=>[item.label,item.capture.name,item.source_version]))}
+      ${table(["Measurement","Source capture","Role","SHA-256","Bytes","Original"],captureRows)}
+      ${chosen.originals?.length?table(["Attached original","Role","SHA-256","Bytes"],chosen.originals.map(item=>[item.name,item.role,`${item.digest.slice(0,12)}…`,n(item.bytes,0)])):"<p class='soft'>This packet carries no original photographs; source captures remain digested summaries.</p>"}
       <p class="soft">Archive matches its included digests. Preserve sender and capture records when sharing it.</p></section>`;
   }
   return `<header class="page-head"><div><h1>Received evidence</h1><p>Open a received StampDesk inspection packet and verify its declared images.</p></div>${actions}</header>
@@ -573,21 +586,31 @@ function pinForm() {
   if (!state.results.length) throw Error("Run a measurement before pinning evidence.");
   const rows=state.results.map(item=>`<label class="row field check"><input type="checkbox" name="result_id" value="${item.id}"${state.result?.id===item.id?" checked":""}>
     <span class="grow">${e(item.label)} · revision ${item.source_version}</span></label>`).join("");
+  const photos=state.tile.photos||[];
+  const sourceRows=photos.map(photo=>`<label class="row field check"><input type="checkbox" name="source_id" value="${photo.id}">
+    <span class="grow">${e(photo.name)} · ${e(photo.role_label||photo.role)} · ${(photo.bytes/1048576).toFixed(1)} MiB</span></label>`).join("");
   modal("Pin inspection evidence",`
     ${textField("Evidence title","title",state.tile.name+" inspection",'required maxlength="115"')}
     <div class="divider-list scroll-list">${rows}</div>${areaField("Notes","notes","",2400)}
     ${textField("Tags, comma separated","tags")}
     ${selectField("Use image layer","view",option("overlay","Measurement maps","overlay")+option("source","Registered source"))}
-    ${checkField("Include original uploads in ZIP","include_sources",false)}`,
+    ${photos.length?`<div class="field"><label>Original photographs in ZIP</label><div class="divider-list scroll-list">${sourceRows}</div></div>
+    ${selectField("Attach first","pack_first",photos.map(photo=>option(photo.id,photo.name)).join(""))}
+    <p class="soft">Checked originals keep their exact bytes and are packed until the 24 MiB packet limit: the attach-first photograph, then the rest in the order listed. Originals that no longer fit stay in the packet as digested source summaries.</p>`:""}`,
     "Pin evidence",async data=>{
-      await api(tileUrl()+"/evidence",{method:"POST",body:{
+      const chosen=data.getAll("source_id");
+      const first=data.get("pack_first");
+      const ordered=first&&chosen.includes(first)?[first,...chosen.filter(id=>id!==first)]:chosen;
+      const reply=await api(tileUrl()+"/evidence",{method:"POST",body:{
         title:data.get("title"),result_ids:data.getAll("result_id"),notes:data.get("notes"),view:data.get("view"),
-        tags:String(data.get("tags")).split(",").map(value=>value.trim()).filter(Boolean),include_sources:data.has("include_sources"),
+        tags:String(data.get("tags")).split(",").map(value=>value.trim()).filter(Boolean),source_photos:ordered,
       }});
       await gatherTile();
       state.tab="evidence";
       commitModal();
-      toast("Inspection evidence pinned.");
+      const size=reply.archive_bytes?` · ${(reply.archive_bytes/1048576).toFixed(1)} MiB packet`:"";
+      const coverage=reply.sources_total?` · originals ${reply.sources_attached}/${reply.sources_total}`:"";
+      toast(`Inspection evidence pinned${size}${coverage}.`);
       render();
     });
 }

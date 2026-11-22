@@ -6,14 +6,18 @@ import json
 from pathlib import PurePath
 import re
 from zipfile import ZIP_DEFLATED, ZipFile
+import zlib
 
 from .art import comparison_sheet, load_artifact_picture, stored_preview
-from .model import InputError, dictionary, enumeration, flag, string, tags, unique_ids
-from .store import document
+from .model import InputError, dictionary, enumeration, flag, string, tags, timestamp, unique_ids
+from .store import document, make_id
 
 
-SOURCE_TOTAL_BYTES = 60 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 24 * 1024 * 1024
 EXPORT_NAME_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+ZIP_COMPRESS_LEVEL = 4
+ZIP_ENTRY_OVERHEAD = 76  # local header (30) + central record (46), excluding the member name
+ZIP_TRAILER_BYTES = 22  # end of central directory record
 
 
 def filename_stem(value, fallback):
@@ -119,22 +123,52 @@ def study_table(report):
     return csv_lines(columns, ([item[key] for key in columns] for item in report["rows"]))
 
 
-def source_index(tile, results):
-    originals = {}
-    for result in results:
+def source_catalog(store, tile, records):
+    """Unique original photographs used by the pinned measurements, keyed by digest."""
+    catalog = {}
+    for result in records:
         provenance = result["provenance"]
         for capture in (provenance["photo"], provenance["paired_photo"]):
             if not capture:
                 continue
             digest = capture["original_digest"]
+            if digest in catalog:
+                continue
             current = next((item for item in tile["photos"] if item["id"] == capture["id"]), None)
-            originals[digest] = {
+            path = store.blobs.path(digest)
+            catalog[digest] = {
                 "digest": digest,
                 "name": capture["display_name"],
                 "role": capture["role"],
                 "mime": current["original_mime"] if current else None,
+                "bytes": path.stat().st_size if path.is_file() else None,
             }
-    return list(originals.values())
+    return catalog
+
+
+def candidate_order(records, include_sources, chosen):
+    """Source digests to try packing, in the order they should be attached."""
+    appearance = []
+    by_id = {}
+    for result in records:
+        provenance = result["provenance"]
+        for capture in (provenance["photo"], provenance["paired_photo"]):
+            if not capture:
+                continue
+            digest = capture["original_digest"]
+            by_id.setdefault(capture["id"], digest)
+            if digest not in appearance:
+                appearance.append(digest)
+    if chosen is None:
+        return appearance if include_sources else []
+    order = []
+    for photo_id in chosen:
+        digest = by_id.get(photo_id)
+        if digest is None:
+            raise InputError("A chosen source photo is not used by the pinned measurements.")
+        if digest not in order:
+            order.append(digest)
+    return order
 
 
 def pinned_fields(store, request):
@@ -144,7 +178,10 @@ def pinned_fields(store, request):
     notes = string(data.get("notes"), "Evidence notes", maximum=2400, required=False)
     view = enumeration(data.get("view", "overlay"), ("overlay", "source"), "Export image")
     include_sources = flag(data.get("include_sources", False), "Include original uploads")
-    return data, targets, title, notes, view, include_sources
+    chosen = data.get("source_photos")
+    if chosen is not None:
+        chosen = unique_ids(chosen, "Source photo", minimum=0, maximum=10)
+    return data, targets, title, notes, view, include_sources, chosen
 
 
 def image_card(store, result, view):
@@ -170,16 +207,107 @@ def evidence_sheets(store, title, records, view):
     return digests
 
 
+def original_arcname(source):
+    suffix = PurePath(source["name"]).suffix.lower().strip(".")
+    suffix = suffix if suffix in ("png", "jpg", "jpeg", "tif", "tiff", "webp") else "img"
+    basename = filename_stem(PurePath(source["name"]).stem, "original")
+    return f"originals/{basename}-{source['digest'][:10]}.{suffix}"
+
+
+def measurement_sources(record, catalog, chosen):
+    sources = []
+    provenance = record["provenance"]
+    for capture in (provenance["photo"], provenance["paired_photo"]):
+        if not capture:
+            continue
+        digest = capture["original_digest"]
+        info = catalog[digest]
+        sources.append({
+            "photo_id": capture["id"],
+            "name": capture["display_name"],
+            "role": capture["role"],
+            "digest": digest,
+            "bytes": info["bytes"],
+            "mime": info["mime"],
+            "attachment": "included" if digest in chosen else "omitted",
+        })
+    return sources
+
+
+def apply_sources(entry, catalog, order):
+    """The evidence record as it looks with the given original digests attached."""
+    chosen = set(order)
+    return {
+        **entry,
+        "originals": [
+            {key: catalog[digest][key] for key in ("digest", "name", "role", "mime")}
+            for digest in order
+        ],
+        "original_bytes": sum(catalog[digest]["bytes"] for digest in order),
+        "measurements": [
+            {**record, "sources": measurement_sources(record, catalog, chosen)}
+            for record in entry["measurements"]
+        ],
+    }
+
+
+def deflated_size(data):
+    compressor = zlib.compressobj(ZIP_COMPRESS_LEVEL, zlib.DEFLATED, -15)
+    return len(compressor.compress(data) + compressor.flush())
+
+
+def member_footprint(name, compressed_size):
+    return ZIP_ENTRY_OVERHEAD + 2 * len(name.encode("utf-8")) + compressed_size
+
+
+def is_summary_member(name):
+    return name in ("inspection.html", "manifest.json") or (
+        name.startswith("measurements/") and name.endswith(".json")
+    )
+
+
+def plan_originals(store, entry, catalog, order, budget):
+    """Choose which candidate originals fit the packet budget, in priority order.
+
+    Member sizes are exact deflated sizes, so the plan matches the final archive
+    byte for byte; create_evidence still re-measures the real ZIP before saving.
+    """
+    static = ZIP_TRAILER_BYTES
+    for name, data in packet_entries(store, apply_sources(entry, catalog, ())):
+        if not is_summary_member(name):
+            static += member_footprint(name, deflated_size(data))
+
+    def summary_size(trial_entry):
+        return sum(
+            member_footprint(name, deflated_size(data))
+            for name, data in packet_entries(store, trial_entry)
+            if is_summary_member(name)
+        )
+
+    footprints = {}
+    for digest in order:
+        compressed = deflated_size(store.blobs.get(digest))
+        footprints[digest] = member_footprint(original_arcname(catalog[digest]), compressed)
+    included = []
+    for digest in order:
+        trial = [*included, digest]
+        total = static + summary_size(apply_sources(entry, catalog, trial))
+        total += sum(footprints[item] for item in trial)
+        if total <= budget:
+            included = trial
+    return included
+
+
 def create_evidence(store, identifier, payload):
-    data, targets, title, notes, view, include_sources = pinned_fields(store, payload)
+    data, targets, title, notes, view, include_sources, chosen = pinned_fields(store, payload)
     tile, records = store.sources_for_evidence(identifier, targets)
     if any(result["tile_id"] != tile["id"] for result in records):
         raise InputError("An evidence packet can contain measurements from its own specimen only.")
-    originals = source_index(tile, records) if include_sources else []
-    byte_total = sum(store.blobs.require(item["digest"]).stat().st_size for item in originals)
-    if byte_total > SOURCE_TOTAL_BYTES:
-        raise InputError("Selected originals exceed the packet limit of 60 MiB. Omit originals or pin fewer measurements.")
-    return store.save_evidence({
+    catalog = source_catalog(store, tile, records)
+    order = candidate_order(records, include_sources, chosen)
+    entry = {
+        "id": make_id(),
+        "created_at": timestamp(),
         "title": title,
         "notes": notes,
         "tags": tags(data.get("tags", [])),
@@ -188,15 +316,37 @@ def create_evidence(store, identifier, payload):
         "tile_version_at_pin": tile["version"],
         "synthetic": tile["synthetic"],
         "view": view,
-        "originals": originals,
-        "original_bytes": byte_total,
         "measurements": records,
         "sheets": evidence_sheets(store, title, records, view),
-    })
+    }
+    included = plan_originals(store, entry, catalog, order, MAX_ARCHIVE_BYTES)
+    while True:
+        final = apply_sources(entry, catalog, included)
+        packed = evidence_zip(store, final)
+        if len(packed) <= MAX_ARCHIVE_BYTES:
+            break
+        if not included:
+            raise InputError("The pinned measurements alone exceed the 24 MiB evidence packet limit. Pin fewer measurements.")
+        included = included[:-1]
+    return store.save_evidence(final), len(packed)
 
 
 def inline_picture(blobstore, digest):
     return "data:image/png;base64," + base64.b64encode(blobstore.get(digest)).decode("ascii")
+
+
+def sources_note(record):
+    sources = record.get("sources")
+    if not sources:
+        return ""
+    parts = []
+    for item in sources:
+        label = f"{escape(item['name'])} ({escape(item['role'])}, sha256 {escape(item['digest'][:12])}…"
+        if item["attachment"] == "included":
+            parts.append(f"{label}, original bytes attached)")
+        else:
+            parts.append(f"{label}, summary only, original not attached)")
+    return f'<p class="sources">Source photographs: {"; ".join(parts)}</p>'
 
 
 def measurement_article(record, sheet):
@@ -217,7 +367,7 @@ def measurement_article(record, sheet):
         figures = f'<img alt="{title} from {location}" src="{sheet}">'
     return (
         f'<article><h2>{title}</h2><p>{location} · specimen revision {rev}</p>'
-        f'{figures}<table>{summaries}</table></article>'
+        f'{figures}{sources_note(record)}<table>{summaries}</table></article>'
     )
 
 
@@ -261,26 +411,28 @@ def artifact_json(payload):
     return (json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False, sort_keys=True) + "\n").encode("utf8")
 
 
+def packet_entries(store, entry):
+    """Evidence archive members except the original photographs, in archive order."""
+    yield "inspection.html", specimen_html(store, entry, interactive=False)
+    yield "manifest.json", artifact_json(entry)
+    for index, digest in enumerate(entry["sheets"], 1):
+        yield f"sheets/sheet-{index:02d}.png", store.blobs.get(digest)
+    for record in entry["measurements"]:
+        name = result_entry_names(record)
+        yield f"measurements/{name}.json", artifact_json(record)
+        yield f"measurements/{name}.csv", result_metrics_table(record)
+        for view, digest in record["pictures"].items():
+            if digest:
+                yield exported_image_name(record, view), store.blobs.get(digest)
+
+
 def evidence_zip(store, entry):
     stream = BytesIO()
-    with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=4) as zipfile:
-        zipfile.writestr("inspection.html", specimen_html(store, entry, interactive=False))
-        zipfile.writestr("manifest.json", artifact_json(entry))
-        for index, digest in enumerate(entry["sheets"], 1):
-            zipfile.writestr(f"sheets/sheet-{index:02d}.png", store.blobs.get(digest))
-        for record in entry["measurements"]:
-            name = result_entry_names(record)
-            zipfile.writestr(f"measurements/{name}.json", artifact_json(record))
-            zipfile.writestr(f"measurements/{name}.csv", result_metrics_table(record))
-            for view, digest in record["pictures"].items():
-                if digest:
-                    zipfile.writestr(exported_image_name(record, view), store.blobs.get(digest))
+    with ZipFile(stream, "w", compression=ZIP_DEFLATED, compresslevel=ZIP_COMPRESS_LEVEL) as zipfile:
+        for name, data in packet_entries(store, entry):
+            zipfile.writestr(name, data)
         for source in entry["originals"]:
-            suffix = PurePath(source["name"]).suffix.lower().strip(".")
-            suffix = suffix if suffix in ("png", "jpg", "jpeg", "tif", "tiff", "webp") else "img"
-            basename = filename_stem(PurePath(source["name"]).stem, "original")
-            file = store.blobs.require(source["digest"])
-            zipfile.write(file, f"originals/{basename}-{source['digest'][:10]}.{suffix}")
+            zipfile.write(store.blobs.require(source["digest"]), original_arcname(source))
     return stream.getvalue()
 
 
@@ -313,4 +465,10 @@ def summarize_result(record):
 
 def summarize_evidence(record):
     keys = ("title", "notes", "id", "tags", "created_at", "tile_id", "tile_name", "tile_version_at_pin", "view")
-    return {**{key: record[key] for key in keys}, "count": len(record["measurements"]), "sheet_count": len(record["sheets"])}
+    summary = {**{key: record[key] for key in keys}, "count": len(record["measurements"]), "sheet_count": len(record["sheets"])}
+    summary["originals"] = len(record.get("originals", []))
+    sources = [item for result in record["measurements"] for item in result.get("sources", [])]
+    if sources:
+        summary["sources_attached"] = sum(1 for item in sources if item["attachment"] == "included")
+        summary["sources_total"] = len(sources)
+    return summary

@@ -387,7 +387,7 @@ class Store:
             return tile, [self._result(conn, result_id) for result_id in result_ids]
 
     def save_evidence(self, fields):
-        record = {**fields, "id": make_id(), "created_at": timestamp()}
+        record = {"id": make_id(), "created_at": timestamp(), **fields}
         with self.transaction(write=True) as conn:
             conn.execute(
                 "INSERT INTO evidence(id,tile_id,document,created_at) VALUES (?,?,?,?)",
