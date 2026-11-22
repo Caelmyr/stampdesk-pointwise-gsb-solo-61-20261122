@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
-from .model import ConflictError, MissingError, digest_identity, identity, timestamp
+from .model import ConflictError, InputError, MissingError, digest_identity, identity, timestamp
 
 
 SCHEMA = """
@@ -318,6 +318,34 @@ class Store:
             result["version"] += 1
             conn.execute("UPDATE results SET document=? WHERE id=?", (document(result), result["id"]))
             event(conn, result["tile_id"], "review", f"Updated {edited} defect review decision(s)")
+            return result
+
+    def save_crossing(self, identifier, expected_version, crossing, picture, message):
+        with self.transaction(write=True) as conn:
+            result = self._result(conn, identifier)
+            self.require_version(result, expected_version)
+            if result["kind"] != "craze":
+                raise InputError("Crossing pairing works from a fine-line network measurement.")
+            if "crossing" in result:
+                raise InputError("This measurement already has a saved crossing pairing. Revise it instead.")
+            result["crossing"] = crossing
+            result["pictures"]["crossing"] = picture
+            result["version"] += 1
+            conn.execute("UPDATE results SET document=? WHERE id=?", (document(result), result["id"]))
+            event(conn, result["tile_id"], "crossing", message)
+            return result
+
+    def revise_crossing(self, identifier, expected_version, crossing, picture, message):
+        with self.transaction(write=True) as conn:
+            result = self._result(conn, identifier)
+            self.require_version(result, expected_version)
+            if result["kind"] != "craze" or "crossing" not in result:
+                raise MissingError("This measurement has no saved crossing to revise.")
+            result["crossing"] = crossing
+            result["pictures"]["crossing"] = picture
+            result["version"] += 1
+            conn.execute("UPDATE results SET document=? WHERE id=?", (document(result), result["id"]))
+            event(conn, result["tile_id"], "crossing", message)
             return result
 
     def _reference(self, conn, identifier):

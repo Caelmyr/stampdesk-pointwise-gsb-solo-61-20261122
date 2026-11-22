@@ -1,7 +1,9 @@
 import {badge, btn, e, img, link, n, percent, plot, stat, table, date, dots} from "./widgets.js";
 
 const colors = ["#58836b","#b26a4a","#818d40","#786f99"];
-const layers = {overlay:"Measurement map",source:"Source plane",paired:"Paired plane",reference:"Reference image"};
+const layers = {overlay:"Measurement map",source:"Source plane",paired:"Paired plane",reference:"Reference image",crossing:"Crossing pairing"};
+const damageColors = ["#6bc4a5","#e89e6d"];
+const basisLabel = {direction:"Continuity of direction",tone:"Matching depth / tone"};
 
 export function metricSet(record) {
   const m = record.metrics;
@@ -16,7 +18,16 @@ export function metricSet(record) {
     glare: () => [["Strong glare",percent(m.strong_glare_percent)],["Counted hotspots",m.hotspot_count],["Paired support",percent(m.support.overlap_percent)]],
     direction: () => [["Left-bright detail",percent(m.left_strong_percent)],["Right-bright detail",percent(m.right_strong_percent)],["Paired support",percent(m.support.overlap_percent)]],
     texture: () => [["Medium local roughness",n(m.grid_roughness["50"],5)],["Ridge axis",m.texture_orientation ? n(m.texture_orientation.ridge_angle_clockwise)+"°" : "—"],["Coherence",n(m.texture_orientation?.coherence,3)]],
-    craze: () => [["Trace length",`${n(m.network_length)} ${m.length_unit}`],["Junctions",n(m.junctions,0)],["Closed cells",n(m.closed_cell_count,0)]],
+    craze: () => {
+      const crossing = record.crossing?.assignment;
+      const rows = [
+        ["Trace length",`${n(m.network_length)} ${m.length_unit}`],
+        ["Junctions",n(m.junctions,0)],["Closed cells",n(m.closed_cell_count,0)],
+      ];
+      if (crossing) rows.push(["Crossing basis",basisLabel[crossing.basis] || crossing.basis],
+        ["Pairing revision",n(crossing.revision_count,0)]);
+      return rows;
+    },
     rim: () => [["Rim median ΔE",n(m.all_edges.median_from_center_delta_e)],["Rim pixels",n(m.all_edges.pixels,0)],["Interior L*",n(m.interior.median_lab[0])]],
     profile: () => [["Distance",`${n(m.line_length)} ${m.distance_unit}`],["Valid stations",`${m.supported_stations}/${m.requested_stations}`],["Median L*",n(m.features.median_lightness)]],
     reference: () => [["Specimen to reference ΔE",n(m.delta_e76)],["Lightness difference",n(m.delta_lab[0])],["Dispersion difference",n(m.dispersion_delta)]],
@@ -116,6 +127,58 @@ function crazeDetail(m) {
   ${table(["Cell","Pixels","Area mm²"],m.largest_cells.map((item,index)=>[index+1,item.pixels,n(item.mm2,3)]))}`;
 }
 
+function matchingPairs(option) {
+  return option.matching.map(pair=>pair.map(arm=>`A${arm+1}`).join("–")).join(", ");
+}
+
+function crossingDetail(record) {
+  const crossing = record.crossing;
+  if (!crossing) {
+    return `<h3>Crack crossing pairing</h3>
+      <p class="plot-note">The trace keeps every observed thread. Frame one four-arm crossing to split it into two archive damage numbers. Each arm is assigned once; unsupported gaps are never drawn as crack.</p>
+      <div class="actions">${btn("Frame crossing","crossing-add","primary","measure")}</div>`;
+  }
+  const assignment = crossing.assignment;
+  const adopted = assignment.basis;
+  const discarded = adopted === "direction" ? "tone" : "direction";
+  const canRevise = assignment.revision_count < 1;
+  const damageRows = assignment.damages.map((damage,index)=>{
+    const arms = damage.arm_ids.map(arm=>`A${arm+1}`).join(" + ");
+    return `<div class="row crossing-damage" data-damage="${index}">
+      <span class="damage-chip" style="background:${damageColors[index]}"></span>
+      <div class="grow"><strong>${e(damage.label)}</strong><br>
+        <small>${e(arms)} · ${n(damage.length)} ${e(damage.length_unit)} · ${n(damage.trace_pixels,0)} traced px</small></div>
+      ${btn("Inspect","crossing-inspect","tiny secondary",null,`data-damage="${index}"`)}</div>`;
+  }).join("");
+  const optionRows = crossing.matching_options.map((option,index)=>{
+    const isDirection = JSON.stringify(option.matching)===JSON.stringify(crossing.direction_matching);
+    const isTone = JSON.stringify(option.matching)===JSON.stringify(crossing.tone_matching);
+    const basis = isDirection ? "direction" : isTone ? "tone" : "";
+    const adoptedHere = basis === adopted;
+    return [index+1,matchingPairs(option),n(option.continuity_total,1),n(option.tone_gap_total,2),
+      basis ? basisLabel[basis] : "—", adoptedHere ? "Adopted" : (basis===discarded ? "Set aside" : "")];
+  });
+  const history = assignment.history.map((entry,index)=>`<div class="row">
+    <div class="grow"><strong>Revision ${index+1} · ${e(basisLabel[entry.basis]||entry.basis)}</strong><br>
+    <small>${e(entry.reason || "No reason recorded")}</small></div></div>`).join("");
+  return `<h3>Crack crossing pairing</h3>
+    <p class="plot-note">Four visible arms split into two damage numbers. The adopted basis is <strong>${e(basisLabel[adopted]||adopted)}</strong>${
+      crossing.bases_conflict ? `; the ${e(basisLabel[discarded]||discarded)} reading was set aside and is kept below for review.` : "; both kinds of evidence agree here."}</p>
+    <div class="divider-list">${damageRows}</div>
+    <details><summary>Pairing evidence (all three perfect matchings)</summary>
+      ${table(["Option","Arm pairs","Direction score (higher)","Tone gap px (lower)","Basis","Status"],optionRows)}
+      <p class="plot-note">Scores come only from traced centerlines. No pixels are interpolated across unphotographed gaps.</p></details>
+    <details><summary>Arm measurements</summary>
+      ${table(["Arm","Heading °","Median width px","Length","Traced px","Tip (x, y)"],
+        crossing.arms.map((arm,index)=>[`A${index+1}`,n(arm.heading_deg,1),n(arm.median_width_px,1),
+          `${n(arm.length)} ${e(crossing.unit)}`,n(arm.trace_pixels,0),arm.tip.map(v=>n(v,3)).join(" / ")]))}</details>
+    ${history ? `<details open><summary>Revision history</summary><div class="divider-list">${history}</div></details>` : ""}
+    <div class="actions">
+      ${canRevise ? btn("Revise pairing once","crossing-revise","secondary","edit") : badge("One revision used","caution")}
+    </div>
+    ${canRevise ? `<p class="plot-note">After checking earlier photographs you may switch this crossing once to the other basis; both damage numbers, their lengths and image fragments update together.</p>` : ""}`;
+}
+
 function rimDetail(m) {
   return `<h3>Rim color by side</h3><p class="plot-note">${e(m.note)}</p>
   ${table(["Side","Pixels","Median from interior ΔE","Excluded"],m.sides.map(item=>[item.side,item.stats?.pixels,n(item.stats?.median_from_center_delta_e),percent(item.excluded_percent)]))}`;
@@ -134,7 +197,8 @@ function details(record) {
         r.punch,n(r.distance,3),n(r.spacing_from_previous,3),r.relative_position.map(x=>n(x,4)).join(" / ")
       ]))}`,
     color:colorDetail,coverage:coverageDetail,defects:defectsDetail,glare:glareDetail,
-    direction:directionDetail,texture:textureDetail,profile:profileDetail,reference:referenceDetail,craze:crazeDetail,rim:rimDetail,
+    direction:directionDetail,texture:textureDetail,profile:profileDetail,reference:referenceDetail,
+    craze:m=>crazeDetail(m)+(record.kind==="craze"?crossingDetail(record):""),rim:rimDetail,
     marking:markingDetail,joint:jointDetail,aggregate:aggregateDetail,blade:bladeDetail,
   }[record.kind];
   return render(record.kind==="defects" ? record : record.metrics);
@@ -142,7 +206,9 @@ function details(record) {
 
 export function resultCard(record, layer, currentRevision) {
   const path=`/api/results/${record.id}`;
-  const available = ["overlay","source",...(record.pictures.paired ? ["paired"] : []),...(record.metrics.reference_image ? ["reference"] : [])];
+  const available = ["overlay","source",...(record.pictures.paired ? ["paired"] : []),
+    ...(record.metrics.reference_image ? ["reference"] : []),
+    ...(record.pictures.crossing ? ["crossing"] : [])];
   const old = record.source_version !== currentRevision;
   return `<section class="card stack">
     <div class="title-row"><div><h3>${e(record.label)}</h3><small>Specimen revision ${record.source_version} · ${e(date(record.created_at))}</small></div>${old ? badge("Earlier specimen revision","caution") : badge("Saved measurement","ready")}</div>

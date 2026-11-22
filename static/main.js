@@ -633,6 +633,119 @@ function parsedOptions(data,tool) {
   }));
 }
 
+function crossingSourceImage() {
+  const record=state.result;
+  const photo=state.tile.photos.find(item=>item.id===record.provenance.photo.id);
+  return photo?.registered_url || photo?.preview_url;
+}
+
+function refreshOpenProposal() {
+  if (dialog.open && q("#crossing-proposal",dialog) && state.result?.kind==="craze") {
+    void refreshCrossingProposal(state.result);
+  }
+}
+
+async function crossingForm() {
+  const record=state.result;
+  if (!record || record.kind!=="craze") throw Error("Open a fine-line network measurement first.");
+  const image=crossingSourceImage();
+  if (!image) throw Error("The source photo is no longer registered.");
+  const existing=record.crossing;
+  modal("Frame the crack crossing",
+    `<p class="notice">Click two opposite corners around the single crossing with four visible thread ends. Each arm is assigned to exactly one damage number; unphotographed gaps are never filled.</p>
+    ${drawing(image,"Specimen plane for crossing frame")}
+    <div class="actions">${btn("Clear points","draw-clear","tiny secondary")}${btn("Undo point","draw-undo","tiny ghost")}<span class="soft" id="draw-count"></span></div>
+    <div id="crossing-proposal"></div>
+    <div class="form-columns">${textField("Damage number 1","label_1",existing?.assignment.damages[0]?.label || "D-001",'required maxlength="24"')}
+    ${textField("Damage number 2","label_2",existing?.assignment.damages[1]?.label || "D-002",'required maxlength="24"')}</div>
+    <div id="crossing-basis"></div>`,
+    "Save pairing",async data=>{
+      if (drawPoints.length!==2) throw Error("Mark two opposite corners of the crossing frame.");
+      const basis=q("input[name='basis']:checked",dialog)?.value || "direction";
+      const payload={version:record.version,box:drawPoints,basis,
+        label_1:data.get("label_1"),label_2:data.get("label_2")};
+      state.result=await api(`/api/results/${record.id}/crossing`,{method:"PUT",body:payload});
+      state.layer="crossing";
+      await gatherTile();
+      commitModal();
+      toast("Crossing paired into two damage numbers.");
+      render();
+    },true);
+  prepareDrawing(existing ? [[existing.box[0],existing.box[1]],[existing.box[2],existing.box[3]]] : [],2);
+  refreshCrossingProposal(record);
+}
+
+async function refreshCrossingProposal(record) {
+  const output=q("#crossing-proposal",dialog);
+  const basisBox=q("#crossing-basis",dialog);
+  if (!output || drawPoints.length!==2) {
+    if (output) output.innerHTML="";
+    if (basisBox) basisBox.innerHTML="";
+    return;
+  }
+  try {
+    const proposal=await api(`/api/results/${record.id}/crossing/preview`,{
+      method:"POST",body:{box:drawPoints},
+    });
+    const pairText=matching=>matching.map(pair=>pair.map(arm=>`A${arm+1}`).join("–")).join(", ");
+    output.innerHTML=`<div class="notice">Found junction at ${proposal.junction_center.map(v=>n(v,3)).join(" / ")} · four arms.
+      Direction pairing: <strong>${e(pairText(proposal.direction_matching))}</strong> · Tone pairing: <strong>${e(pairText(proposal.tone_matching))}</strong>${
+      proposal.bases_conflict?' · <em>the two kinds of evidence disagree</em>':''}</div>`;
+    const current=record.crossing?.assignment.basis || "direction";
+    basisBox.innerHTML=`<div class="field"><span>Adopt which pairing basis?</span>
+      <label class="field check"><input type="radio" name="basis" value="direction" ${current==="direction"?"checked":""}> Continuity of direction (follow the running fissure)</label>
+      <label class="field check"><input type="radio" name="basis" value="tone" ${current==="tone"?"checked":""}> Matching depth / tone (join equally dark, equally wide arms)</label></div>`;
+  } catch (err) {
+    output.innerHTML=`<p class="notice warn">${e(err.message)}</p>`;
+  }
+}
+
+function inspectDamage(damageIndex) {
+  const record=state.result;
+  const crossing=record.crossing;
+  if (!crossing) return;
+  const damage=crossing.assignment.damages[damageIndex];
+  const other=crossing.assignment.damages[1-damageIndex];
+  const adopted=crossing.assignment.basis;
+  const discarded=adopted==="direction"?"tone":"direction";
+  const basisNote=crossing.bases_conflict
+    ? `The ${discarded==="tone"?"matching-depth":"straight-direction"} reading was set aside; its arm pairs are listed in the pairing-evidence table.`
+    : "Direction and depth evidence recommend the same pairing here.";
+  modal(`Damage ${damage.label}`,
+    `<div class="divider-list">
+      <div class="row"><div class="grow"><strong>Assigned arms</strong><br><small>${e(damage.arm_ids.map(a=>`A${a+1}`).join(" + "))}</small></div></div>
+      <div class="metrics">${stat("Length",`${n(damage.length)} ${e(damage.length_unit)}`)}${stat("Traced pixels",n(damage.trace_pixels,0))}${stat("Median width px",n(damage.median_width_px,1))}</div>
+      <div class="row"><div class="grow"><strong>Image fragment (normalized bounds)</strong><br><small>${damage.bounds.map(v=>n(v,4)).join(" / ")}</small></div></div>
+      <div class="row"><div class="grow"><strong>Other damage number</strong><br><small>${e(other.label)} takes arms ${e(other.arm_ids.map(a=>`A${a+1}`).join(" + "))}; no arm is shared.</small></div></div>
+    </div><p class="notice">${e(basisNote)}</p>`,
+    "",null);
+}
+
+async function reviseCrossingForm() {
+  const record=state.result;
+  const crossing=record.crossing;
+  if (!crossing) return;
+  const assignment=crossing.assignment;
+  if (assignment.revision_count>=1) throw Error("This crossing has already used its one revision.");
+  const target=assignment.basis==="direction"?"tone":"direction";
+  modal("Revise the crossing pairing once",
+    `<p class="notice">Switch from <strong>${e({direction:"continuity of direction",tone:"matching depth / tone"}[assignment.basis])}</strong> to <strong>${e({direction:"continuity of direction",tone:"matching depth / tone"}[target])}</strong>. Both damage numbers change together; lengths and image fragments are recomputed from the same traced arms.</p>
+    ${areaField("Reason from earlier photograph","reason","",400)}
+    <div class="form-columns">${textField("Damage number 1","label_1",assignment.damages[0].label,'required maxlength="24"')}
+    ${textField("Damage number 2","label_2",assignment.damages[1].label,'required maxlength="24"')}</div>`,
+    "Apply revision",async data=>{
+      state.result=await api(`/api/results/${record.id}/crossing`,{method:"PATCH",body:{
+        version:record.version,basis:target,reason:data.get("reason"),
+        label_1:data.get("label_1"),label_2:data.get("label_2"),
+      }});
+      state.layer="crossing";
+      await gatherTile();
+      commitModal();
+      toast("Pairing revised; both damage numbers updated together.");
+      render();
+    });
+}
+
 async function runMeasurement(data) {
   const revision=travel;
   const result=await api(tileUrl()+"/results",{method:"POST",body:{
@@ -695,8 +808,8 @@ async function doAction(name,target) {
     "region-remove":()=>modal("Remove sampling region?",'<p>Saved measurements retain their snapshot of this region.</p>',"Remove region",async ()=>{
       await patchTile("/regions/"+id,"DELETE",{},"Sampling region removed.");
     }),
-    "draw-clear":()=>{drawPoints=[];drawUpdate();},
-    "draw-undo":()=>{drawPoints.pop();drawUpdate();},
+    "draw-clear":()=>{drawPoints=[];drawUpdate();refreshOpenProposal();},
+    "draw-undo":()=>{drawPoints.pop();drawUpdate();refreshOpenProposal();},
     neutral:neutralForm,
     "neutral-clear":()=>patchTile("/calibration","DELETE",{},"Neutral-card balance cleared."),
     "reference-add":refForm,
@@ -734,6 +847,9 @@ async function doAction(name,target) {
       render();
     },
     "result-layer":()=>{state.layer=value;render();},
+    "crossing-add":()=>crossingForm(),
+    "crossing-revise":()=>reviseCrossingForm(),
+    "crossing-inspect":()=>inspectDamage(Number(target.dataset.damage)),
     "defect-choice":async ()=>{
       state.result=await api(`/api/results/${state.result.id}/observations/${marker}`,{method:"PUT",body:{version:state.result.version,decision:value,notes:""}});
       toast("Observation reviewed.");
@@ -777,6 +893,9 @@ document.addEventListener("click",event=>{
     const v=Math.min(1,Math.max(0,(event.clientY-rect.top)/rect.height));
     drawPoints.push([Number(u.toFixed(6)),Number(v.toFixed(6))]);
     drawUpdate();
+    if (dialog.open && q("#crossing-proposal",dialog) && state.result?.kind==="craze") {
+      void refreshCrossingProposal(state.result);
+    }
   }
 });
 

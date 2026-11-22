@@ -83,6 +83,29 @@ def result_metrics_table(record):
     elif kind == "craze":
         columns = ("cell", "pixels", "area_mm2", "bounds")
         rows = ([i, item["pixels"], item["mm2"], item["bounds"]] for i, item in enumerate(metrics["largest_cells"], 1))
+        crossing = record.get("crossing")
+        if crossing:
+            assignment = crossing["assignment"]
+            columns = (
+                "record", "damage_label", "basis", "arm_ids", "length", "length_unit",
+                "length_px", "trace_pixels", "median_width_px", "bounds", "revision_count",
+            )
+            rows = (
+                [
+                    "crossing_damage",
+                    damage["label"],
+                    assignment["basis"],
+                    " ".join(f"A{arm + 1}" for arm in damage["arm_ids"]),
+                    damage["length"],
+                    damage["length_unit"],
+                    damage["length_px"],
+                    damage["trace_pixels"],
+                    damage["median_width_px"],
+                    damage["bounds"],
+                    assignment["revision_count"],
+                ]
+                for damage in assignment["damages"]
+            )
     elif kind == "direction":
         columns = ("cell", "median_signed", "strong_percent", "positive_percent")
         rows = ([item[key] for key in columns] for item in metrics["cells"])

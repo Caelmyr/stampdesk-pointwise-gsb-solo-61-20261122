@@ -154,6 +154,9 @@ dialog::backdrop{background:#172a24b5}
 .draw-point{fill:#eac181;stroke:#1f3127;stroke-width:2;vector-effect:non-scaling-stroke}
 .draw-line{stroke:#f4c96d;stroke-width:2;vector-effect:non-scaling-stroke;fill:#eab95c33}
 .draw-label{paint-order:stroke;stroke:#18291e;fill:#fff7d7;stroke-width:2px;vector-effect:non-scaling-stroke;font-size:30px}
+.crossing-damage{background:#fbfaf5}
+.damage-chip{width:14px;height:14px;border-radius:50%;flex:none;border:1px solid #30382b26}
+#crossing-proposal:empty,#crossing-basis:empty{display:none}
 .stage-pair{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .stage-pair img{object-fit:contain;width:100%;max-height:55vh}
 #toast{position:fixed;bottom:19px;right:21px;max-width:min(440px,calc(100% - 42px));padding:10px 13px;border-radius:7px;color:#fffbe6;background:#263b30;box-shadow:var(--shadow);z-index:8}

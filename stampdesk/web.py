@@ -7,6 +7,7 @@ from flask import Blueprint, Flask, Response, jsonify, request, send_file, send_
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 from .analysis import approve_reference, evaluate
+from .crossing import create_crossing, preview_crossing, update_crossing
 from .demo import load_training, preview_photo
 from .evidence import (
     artifact_json,
@@ -252,8 +253,11 @@ def register_measurements(api, store, heavy):
     @api.get("/results/<measurement_id>/image/<layer>")
     def measurement_image(measurement_id, layer):
         data = store.result(measurement_id)
-        chosen = enumeration(layer, ("overlay", "source", "paired", "reference"), "Measurement image")
-        digest = data["metrics"].get("reference_image") if chosen == "reference" else data["pictures"][chosen]
+        chosen = enumeration(layer, ("overlay", "source", "paired", "reference", "crossing"), "Measurement image")
+        if chosen == "reference":
+            digest = data["metrics"].get("reference_image")
+        else:
+            digest = data["pictures"].get(chosen)
         return png_blob(store, digest)
 
     @api.get("/results/<measurement_id>/metrics.csv")
@@ -283,6 +287,26 @@ def register_measurements(api, store, heavy):
         choices = parse_reviews(data)
         with heavy:
             record = save_reviews(store, measurement_id, model_version(data), choices)
+        return jsonify(record)
+
+    @api.post("/results/<measurement_id>/crossing/preview")
+    def crossing_proposal(measurement_id):
+        with heavy:
+            proposal = preview_crossing(store, store.result(measurement_id), json_request())
+        return jsonify(proposal)
+
+    @api.put("/results/<measurement_id>/crossing")
+    def crossing_save(measurement_id):
+        data = json_request()
+        with heavy:
+            record = create_crossing(store, store.result(measurement_id), model_version(data), data)
+        return jsonify(record)
+
+    @api.patch("/results/<measurement_id>/crossing")
+    def crossing_change(measurement_id):
+        data = json_request()
+        with heavy:
+            record = update_crossing(store, store.result(measurement_id), model_version(data), data)
         return jsonify(record)
 
     @api.get("/library")
