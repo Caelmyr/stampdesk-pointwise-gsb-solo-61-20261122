@@ -140,15 +140,33 @@ function details(record) {
   return render(record.kind==="defects" ? record : record.metrics);
 }
 
+function batchPanel(record) {
+  const batch=record.batch_calibration || record.provenance.batch_calibration;
+  if (!batch) return "";
+  const face=[["Batch",batch.batch],["Gains R / G / B",batch.gains.map(value=>n(value,4)).join(" / ")],
+    ["Card target",`${n(batch.target,3)} ± ${n(batch.tolerance,3)}`],
+    ["Printed face in range",percent(batch.print_face_remaining_percent)],
+    ["Printed face excluded",n(batch.print_face_overflow_pixels,0)],
+    ["Measured area left",percent(batch.remaining_percent)]];
+  return `<h3>Batch gain set</h3>
+    <p class="notice">${batch.plate_passed?"This plate can be color-matched under the one batch gain set.":"This plate cannot be matched under the registered batch gain set and cannot be approved."} One set serves ${batch.passing_count} of ${batch.plate_count} plates.</p>
+    <div class="metrics">${stat("Card deviation",batch.max_absolute_deviation==null?"—":n(batch.max_absolute_deviation,4))}${stat("Face in range",percent(batch.print_face_remaining_percent))}${stat("Plate passes",batch.plate_passed?"Yes":"No")}</div>
+    ${table(["Property","Value"],face)}
+    ${batch.failed_plates.length?`<details><summary>Plates this set cannot serve</summary>${table(["Plate","Card deviation","Printed face in range"],batch.failed_plates.map(item=>[item.name,item.max_absolute_deviation==null?"—":n(item.max_absolute_deviation,4),percent(item.print_remaining_percent)]))}</details>`:""}`;
+}
+
 export function resultCard(record, layer, currentRevision) {
   const path=`/api/results/${record.id}`;
   const available = ["overlay","source",...(record.pictures.paired ? ["paired"] : []),...(record.metrics.reference_image ? ["reference"] : [])];
   const old = record.source_version !== currentRevision;
+  const batch=record.batch_calibration || record.provenance.batch_calibration;
   return `<section class="card stack">
-    <div class="title-row"><div><h3>${e(record.label)}</h3><small>Specimen revision ${record.source_version} · ${e(date(record.created_at))}</small></div>${old ? badge("Earlier specimen revision","caution") : badge("Saved measurement","ready")}</div>
+    <div class="title-row"><div><h3>${e(record.label)}</h3><small>Specimen revision ${record.source_version} · ${e(date(record.created_at))}</small></div>
+    ${old ? badge("Earlier specimen revision","caution") : batch&&!batch.plate_passed ? badge("Not color-matchable in batch","caution") : badge("Saved measurement","ready")}</div>
     <div class="actions">${available.map(key=>btn(layers[key],"result-layer",layer===key?"tiny primary":"tiny secondary",null,`data-value="${key}"`)).join("")}</div>
     <figure class="stage">${img(path+"/image/"+layer+"?v="+record.version,`${record.label} · ${layers[layer]}`)}</figure>
     ${layer==="overlay"?legend(record):""}
+    ${batchPanel(record)}
     ${metricSet(record)}
     <section>${details(record)}</section>
     <details><summary>Measurement source</summary>${table(["Property","Value"],[
@@ -156,7 +174,7 @@ export function resultCard(record, layer, currentRevision) {
       ["Photo digest",record.provenance.photo.original_digest],
       ["Supported area",percent(record.support.available_percent)],
       ["Clipped pixels",record.support.clipped_pixels],
-      ["Neutral correction",record.provenance.neutral_card?.before_swatch || "Uncorrected"],
+      ["Neutral correction",batch?`Batch gains · ${e(batch.batch)}`:(record.provenance.neutral_card?.before_swatch || "Uncorrected")],
     ])}</details>
     <div class="actions">${link("Metrics CSV",path+"/metrics.csv","secondary","download")}${btn("Pin evidence","pin", "primary","archive")}</div>
   </section>`;

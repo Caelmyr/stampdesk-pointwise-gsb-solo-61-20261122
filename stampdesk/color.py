@@ -19,6 +19,36 @@ LAB_BREAK = 6.0 / 29.0
 MIN_CARD_SAMPLES = 40
 MIN_CARD_LEVEL = 0.012
 MAX_CARD_CHROMA_SPREAD = 0.22
+MAX_CORRECTED_LEVEL = 1.0
+DEFAULT_NEUTRAL_TARGET = 0.18
+DEFAULT_CARD_TOLERANCE = 0.015
+
+
+def corrected_overflow(linear):
+    """Pixels pushed outside the representable range by channel gains.
+
+    A corrected sample above 1.0 can no longer be distinguished from a
+    neighbouring sample that also saturated, so it must not take part in a
+    color comparison.
+    """
+    values = np.asarray(linear, dtype=np.float32)
+    return np.any(~np.isfinite(values) | (values > MAX_CORRECTED_LEVEL), axis=-1)
+
+
+def corrected_card(card, gains, target, tolerance):
+    """Validate each linear card channel against the target after gains."""
+    median = np.asarray(card, dtype=np.float64)
+    correction = np.asarray(gains, dtype=np.float64)
+    corrected = median * correction
+    deviations = corrected - float(target)
+    limit = float(tolerance) + 1e-9
+    return {
+        "card_median_linear_rgb": float_list(median, 7),
+        "corrected_card_linear_rgb": float_list(corrected, 7),
+        "channel_deviations": float_list(deviations, 7),
+        "max_absolute_deviation": round(float(np.max(np.abs(deviations))), 7),
+        "passed": bool(np.all(np.abs(deviations) <= limit)),
+    }
 
 
 def linear_lab(rgb):
@@ -68,7 +98,8 @@ def float_list(values, places=4):
     return np.round(np.asarray(values, dtype=np.float64), places).tolist()
 
 
-def robust_neutral(frame, neutral_region, candidate_area, target):
+def measure_card(frame, neutral_region, candidate_area):
+    """Read a neutral card patch and reject unsuitable selections."""
     measured_area = polygon_mask(frame.extent, neutral_region["vertices"]) & candidate_area
     native_count = int(np.count_nonzero(measured_area & frame.valid))
     support = measured_area & frame.valid & ~frame.clipped
@@ -90,6 +121,17 @@ def robust_neutral(frame, neutral_region, candidate_area, target):
     spread = np.quantile(chroma, 0.9, axis=0) - np.quantile(chroma, 0.10, axis=0)
     if np.max(spread) > MAX_CARD_CHROMA_SPREAD:
         raise InputError("Card chroma varies too much. Keep the entire selection inside the neutral patch.")
+    return {
+        "card": card,
+        "samples": count,
+        "native_samples": native_count,
+        "lightness_range": (floor, mid, ceiling),
+    }
+
+
+def robust_neutral(frame, neutral_region, candidate_area, target):
+    measured = measure_card(frame, neutral_region, candidate_area)
+    card = measured["card"]
     gains = np.full(3, target, dtype=np.float32) / card
     if np.max(gains) > 4 or np.min(gains) < 0.22:
         raise InputError("Card exposure would require channel gains outside the supported range.")
@@ -98,11 +140,11 @@ def robust_neutral(frame, neutral_region, candidate_area, target):
         "gains": float_list(gains, 7),
         "photo_id": frame.photo["id"],
         "region_id": neutral_region["id"],
-        "card_samples": count,
+        "card_samples": measured["samples"],
         "card_median_linear_rgb": float_list(card, 7),
         "before_swatch": swatch(card),
         "after_swatch": swatch(card * gains),
-        "card_lightness_range": float_list((floor, mid, ceiling), 6),
+        "card_lightness_range": float_list(measured["lightness_range"], 6),
     }
 
 
@@ -121,8 +163,40 @@ def calibration_for(tile, frame):
     return record
 
 
-def corrected_linear(tile, frame, enabled=True):
-    record = calibration_for(tile, frame) if enabled else None
+def batch_member(record, tile_id):
+    if not record:
+        return None
+    return next((item for item in record.get("members", []) if item["tile_id"] == tile_id), None)
+
+
+def batch_correction(record, tile_id):
+    member = batch_member(record, tile_id)
+    correction = {
+        "scope": "batch",
+        "batch": record["batch"],
+        "target": record["target"],
+        "tolerance": record["tolerance"],
+        "gains": list(record["gains"]),
+        "member": member,
+        "passed": bool(member and member.get("passed")),
+    }
+    if member and member.get("card_median_linear_rgb"):
+        card = np.asarray(member["card_median_linear_rgb"], dtype=np.float32)
+        gains = np.asarray(record["gains"], dtype=np.float32)
+        correction["card_samples"] = member.get("card_samples")
+        correction["card_median_linear_rgb"] = list(member["card_median_linear_rgb"])
+        correction["before_swatch"] = swatch(card)
+        correction["after_swatch"] = swatch(card * gains)
+    return correction
+
+
+def corrected_linear(tile, frame, enabled=True, batch_record=None):
+    if not enabled:
+        return frame.linear, None
+    if batch_record is not None and batch_record.get("gains"):
+        gains = np.array(batch_record["gains"], dtype=np.float32)
+        return frame.linear * gains, batch_correction(batch_record, tile["id"])
+    record = calibration_for(tile, frame)
     if record is None:
         return frame.linear, None
     gains = np.array(record["gains"], dtype=np.float32)
@@ -246,6 +320,10 @@ def matching_basis(first, second):
         return "This comparison mixes synthetic and photographed material."
     if first["photo_role"] != second["photo_role"]:
         return "The illumination labels differ. Interpret these color distances accordingly."
+    if first.get("correction_scope") != second.get("correction_scope"):
+        return "One side uses a batch gain set and the other does not. The color distances mix correction scopes."
+    if first.get("correction_scope") == "batch" and first.get("batch") != second.get("batch"):
+        return "The pair uses different batch gain sets. Interpret these color distances accordingly."
     a, b = first["neutral_target"], second["neutral_target"]
     if a != b:
         return "The pair uses different neutral-card targets or one result uses uncorrected color."
@@ -265,6 +343,8 @@ def capture_basis(tile, frame, correction):
         "photo_role": frame.photo["role"],
         "synthetic": bool(frame.photo.get("synthetic")),
         "neutral_target": correction["target"] if correction else None,
+        "correction_scope": correction.get("scope", "plate") if correction else None,
+        "batch": correction.get("batch") if correction else None,
         "source_space": frame.photo["working_color_space"],
         "tile_id": tile["id"],
     }

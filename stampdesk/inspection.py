@@ -14,7 +14,8 @@ def side_preview(store, tile, photo_id, layer):
     frame = specimen_frame(store.blobs, tile, photo_id)
     if layer == "raw":
         return base_rgba(frame)
-    corrected, _ = corrected_linear(tile, frame, layer in ("corrected", "regions"))
+    record = store.batch_calibration(tile.get("batch"))
+    corrected, _ = corrected_linear(tile, frame, layer in ("corrected", "regions"), record)
     if layer == "regions":
         return annotated_regions(frame, tile["regions"], corrected)
     return base_rgba(frame, corrected)

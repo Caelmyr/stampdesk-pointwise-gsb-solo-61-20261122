@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS batch_calibrations (
+    batch TEXT PRIMARY KEY,
+    document TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -474,3 +479,30 @@ class Store:
                 "SELECT document FROM metrology WHERE tile_id=? ORDER BY rowid DESC LIMIT 50", (chosen,),
             ).fetchall()
             return [json.loads(row["document"]) for row in rows]
+
+    def batch_calibration(self, batch):
+        if not batch:
+            return None
+        with self.connect() as conn:
+            row = conn.execute("SELECT document FROM batch_calibrations WHERE batch=?", (batch,)).fetchone()
+            return json.loads(row["document"]) if row else None
+
+    def batch_calibrations(self):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT document FROM batch_calibrations ORDER BY batch").fetchall()
+            return [json.loads(row["document"]) for row in rows]
+
+    def save_batch_calibration(self, record):
+        now = timestamp()
+        stored = {**record, "updated_at": now}
+        with self.transaction(write=True) as conn:
+            conn.execute(
+                "INSERT INTO batch_calibrations(batch,document,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(batch) DO UPDATE SET document=excluded.document, updated_at=excluded.updated_at",
+                (stored["batch"], document(stored), now),
+            )
+        return stored
+
+    def clear_batch_calibration(self, batch):
+        with self.transaction(write=True) as conn:
+            conn.execute("DELETE FROM batch_calibrations WHERE batch=?", (batch,))

@@ -7,6 +7,8 @@ from flask import Blueprint, Flask, Response, jsonify, request, send_file, send_
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 from .analysis import approve_reference, evaluate
+from .batchcal import register_batch_calibration, summarize_batch
+from .color import DEFAULT_CARD_TOLERANCE, DEFAULT_NEUTRAL_TARGET
 from .demo import load_training, preview_photo
 from .evidence import (
     artifact_json,
@@ -232,6 +234,33 @@ def register_specimens(api, store, heavy):
     @api.delete("/specimens/<specimen_id>/calibration")
     def calibration_remove(specimen_id):
         return jsonify(present_tile(clear_calibration(store, specimen_id, json_request())))
+
+    @api.get("/batch-calibrations")
+    def batch_calibrations():
+        return jsonify({
+            "items": [summarize_batch(item) for item in store.batch_calibrations()],
+            "defaults": {"target": DEFAULT_NEUTRAL_TARGET, "tolerance": DEFAULT_CARD_TOLERANCE},
+        })
+
+    @api.get("/batch-calibrations/<path:batch>")
+    def batch_calibration_show(batch):
+        record = store.batch_calibration(batch)
+        if record is None:
+            raise MissingError("No batch gain set is registered for this batch.")
+        return jsonify(record)
+
+    @api.put("/batch-calibrations/<path:batch>")
+    def batch_calibration_save(batch):
+        payload = json_request()
+        payload = {**payload, "batch": batch}
+        with heavy:
+            record = register_batch_calibration(store, payload)
+        return jsonify(record)
+
+    @api.delete("/batch-calibrations/<path:batch>")
+    def batch_calibration_remove(batch):
+        store.clear_batch_calibration(batch)
+        return jsonify({"batch": batch, "cleared": True})
 
 
 def register_measurements(api, store, heavy):
@@ -471,6 +500,7 @@ def create_app(data_dir=None):
             "analysis_labels": ANALYSIS_LABELS,
             "tools": TOOLS,
             "study_metrics": public_metrics(),
+            "neutral_defaults": {"target": DEFAULT_NEUTRAL_TARGET, "tolerance": DEFAULT_CARD_TOLERANCE},
         })
 
     @app.errorhandler(InputError)

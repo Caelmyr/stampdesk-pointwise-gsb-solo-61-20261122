@@ -1,7 +1,7 @@
 import {q,qa,icon,e,btn,link,badge,empty,option,img,field,textField,selectField,numField,checkField,areaField,api,request,date,n,percent,plot,stat,table} from "./widgets.js";
 import {resultCard,specimenResultRows} from "./results.js";
 
-const state={page:"collection",tile:null,tiles:[],tab:"captures",tool:"color",capture:null,viewer:"raw",layer:"overlay",result:null,config:null,results:[],refs:[],packets:[],study:null,studies:[],query:""};
+const state={page:"collection",tile:null,tiles:[],tab:"captures",tool:"color",capture:null,viewer:"raw",layer:"overlay",result:null,config:null,results:[],refs:[],packets:[],study:null,studies:[],query:"",batch:null,batches:[]};
 const dialog=q("#dialog");
 const nav=[
   ["collection","Specimens","tiles"],
@@ -112,18 +112,36 @@ function captures() {
   return `<div class="grid-detail">${imagesForCapture()}${captureSide()}</div>`;
 }
 
+function batchPanel() {
+  const batch=state.tile.batch;
+  if (!batch) return `<section class="card"><h3>Batch gain set</h3><p class='soft'>Give this specimen a batch or tray label to share one registered set of channel gains with its siblings.</p></section>`;
+  const record=state.batch;
+  const member=record?.members.find(item=>item.tile_id===state.tile.id);
+  if (!record) return `<section class="card"><h3>Batch gain set · ${e(batch)}</h3>
+    <p class='soft'>No gain set is registered for this batch yet. Register one set for every plate in the batch; later readings all use it.</p>
+    <div class="actions">${btn("Register batch gains","batch-register","primary","sample")}</div></section>`;
+  const fails=record.members.filter(item=>!item.passed);
+  return `<section class="card"><h3>Batch gain set · ${e(record.batch)}</h3>
+    <div class="metrics">${stat("Gains R",n(record.gains[0],4))}${stat("Gains G",n(record.gains[1],4))}${stat("Gains B",n(record.gains[2],4))}${stat("Target",`${n(record.target,3)} ± ${n(record.tolerance,3)}`)}</div>
+    <p class="soft">One set serves ${record.passing_count} of ${record.plate_count} plates. ${member?`This plate ${member.passed?"passes":"cannot be matched"}: its card reaches ${member.max_absolute_deviation==null?"—":n(member.max_absolute_deviation,4)} from target and ${percent(member.print_remaining_percent)} of its printed face stays in range.`:"This plate was not part of the registered set."}</p>
+    ${fails.length?`<h3>Plates this set cannot serve</h3>${table(["Plate","Card deviation","Remaining print"],fails.map(item=>[item.name,item.max_absolute_deviation==null?"—":n(item.max_absolute_deviation,4),percent(item.print_remaining_percent)]))}`:"<p class='notice'>Every plate in this batch passes the card target under this one gain set.</p>"}
+    <div class="actions">${btn("Re-register batch gains","batch-register","secondary","sample")}${btn("Clear batch gains","batch-clear","ghost")}</div></section>`;
+}
+
 function regionPage() {
   const tile=state.tile;
   const current=tile.photos.find(item=>item.registration_state==="base");
   const rows=tile.regions.map(item=>`<div class="row"><div class="grow"><strong class="row-title">${e(item.name)}</strong><small>${e(state.config.region_purposes[item.purpose])}</small></div>
     ${btn("Edit","region-edit","tiny secondary",null,`data-id="${item.id}"`)}</div>`).join("");
   const gains=tile.calibration;
+  const batchMode=Boolean(tile.batch);
   return `<div class="grid-detail"><section class="card"><div class="title-row"><h3>Sampling plane</h3>${current?btn("Draw region","region-add","primary","plus"):""}</div>
      ${current?`<figure class="stage">${img(current.registered_url+"&layer=regions",`Marked regions on ${tile.name}`)}</figure><p class="stage-foot">Region positions are saved in the registered survey plane.</p>`:empty("Set a base photograph from Captures.")}</section>
      <div class="stack"><section class="card"><h3>Saved regions</h3>${rows?`<div class="divider-list">${rows}</div>`:"<p class='soft'>Draw an inspection area, a coverage reference, or a patch to exclude.</p>"}</section>
-     <section class="card"><h3>Neutral-card balance</h3>${gains?`<div class="metrics">${stat("Measured card",gains.before_swatch)}${stat("Balanced card",gains.after_swatch)}${stat("Unclipped card pixels",n(gains.card_samples,0))}</div>`:"<p class='soft'>Use an evenly lit neutral patch to balance this base capture.</p>"}
+     ${batchPanel()}
+     ${batchMode?"":`<section class="card"><h3>Neutral-card balance</h3>${gains?`<div class="metrics">${stat("Measured card",gains.before_swatch)}${stat("Balanced card",gains.after_swatch)}${stat("Unclipped card pixels",n(gains.card_samples,0))}</div>`:"<p class='soft'>Use an evenly lit neutral patch to balance this base capture.</p>"}
        <div class="actions">${btn("Balance neutral card","neutral","secondary","sample")}${gains?btn("Clear balance","neutral-clear","ghost"):""}</div>
-     </section></div></div>`;
+     </section>`}</div></div>`;
 }
 
 function optionInput(key,item) {
@@ -142,11 +160,16 @@ function measureControls() {
   const tool=state.config.tools[state.tool];
   const all=state.tile.photos.filter(item=>item.registered_url);
   const match=field=>sources(tool.capture_pair?all.filter(item=>item.role===tool.capture_pair[field]):all,null,tool.capture_pair?"Auto if unique":"Base capture");
+  const batchBound=Boolean(state.tile.batch&&state.batch);
+  const member=state.batch?.members.find(item=>item.tile_id===state.tile.id);
+  const neutralControl=tool.capture_pair?"":batchBound
+    ? `<p class="soft">Batch gains for ${e(state.tile.batch)} apply to every reading${member?` (this plate ${member.passed?"can":"cannot"} be color-matched under them)`:""}. Print pushed out of range by the gains is excluded from color comparison.</p><input type="hidden" name="apply_neutral" value="on">`
+    : checkField("Apply saved neutral balance","apply_neutral",true);
   return `<form id="measurement-form" class="form-stack">
     ${selectField("Measurement","kind",Object.entries(state.config.tools).map(([name,item])=>option(name,item.label,state.tool)).join(""))}
     <p class="soft">${e(tool.description)}</p>
     ${selectField(tool.capture_pair?"First photo":"Photo source","photo_id",match(0))}
-    ${tool.capture_pair?selectField("Paired photo","comparison_id",match(1)):checkField("Apply saved neutral balance","apply_neutral",true)}
+    ${tool.capture_pair?selectField("Paired photo","comparison_id",match(1)):neutralControl}
     ${selectField("Region","region_id",regions())}
     <div class="form-columns">${Object.entries(tool.fields).map(([key,item])=>optionInput(key,item)).join("")}</div>
     ${["profile","marking","joint","blade","perforation"].includes(state.tool)?btn("Mark line on image","mark-profile","secondary","measure"):""}
@@ -211,8 +234,12 @@ function receivedPage() {
 function tilePage() {
   const tile=state.tile;
   const descriptors=[tile.glaze,tile.body,tile.firing,tile.width_mm&&tile.height_mm?`${tile.width_mm} × ${tile.height_mm} mm`:null].filter(Boolean);
-  return `<header class="page-head"><div><p class="eyebrow">${tile.synthetic?"Synthetic training specimen":"Specimen"}</p><h1>${e(tile.name)}</h1>
-  <p>${e(descriptors.join(" · ") || "Registered stamp mount")}</p></div><div class="actions">${btn("Edit specimen","tile-edit","secondary","edit")}
+  const member=state.batch?.members.find(item=>item.tile_id===tile.id);
+  const batchBadge=state.batch
+    ? badge(member?(member.passed?`Batch ${state.batch.batch} · matchable`:`Batch ${state.batch.batch} · not matchable`):`Batch ${state.batch.batch}`,member&&member.passed?"ready":"caution")
+    : "";
+  return `<header class="page-head"><div><p class="eyebrow">${tile.synthetic?"Synthetic training specimen":"Specimen"}${tile.batch?` · ${e(tile.batch)}`:""}</p><h1>${e(tile.name)}</h1>
+  <p>${e(descriptors.join(" · ") || "Registered stamp mount")}</p>${batchBadge?`<div class="badges">${batchBadge}</div>`:""}</div><div class="actions">${btn("Edit specimen","tile-edit","secondary","edit")}
   ${btn("Approve reference","reference-add","secondary","book")}</div></header>
   <nav class="tabs" aria-label="Specimen tools">${tabs.map(([key,label,glyph])=>`<button type="button" class="tab ${state.tab===key?"active":""}" data-do="tile-tab" data-value="${key}">${icon(glyph)}${e(label)}</button>`).join("")}</nav>
   ${{captures,regions:regionPage,measure:measurements,geometry:geometryPage,evidence:evidencePage}[state.tab]()}`;
@@ -220,7 +247,12 @@ function tilePage() {
 
 function libraryPage() {
   const items=state.refs;
+  const batches=state.batches||[];
+  const batchSection=batches.length?`<section class="card stack"><h3>Registered batch gains</h3>
+    ${table(["Batch","Gains","Plates served","Target"],batches.map(item=>[item.batch,item.gains.map(value=>n(value,3)).join(" / "),`${item.passing_count} / ${item.plate_count}`,`${n(item.target,3)} ± ${n(item.tolerance,3)}`]))}
+    ${batches.filter(item=>item.failed_plates.length).map(item=>`<p class="notice">${e(item.batch)}: ${e(item.failed_plates.map(row=>row.name).join(", "))} cannot be matched under this set.</p>`).join("")}</section>`:"";
   return `<header class="page-head"><div><h1>Reference library</h1><p>Approved color samples retain their capture, region, and neutral-card basis.</p></div></header>
+    ${batchSection}
     ${items.length?`<div class="collection">${items.map(ref=>`<article class="card stack">${img(`/api/library/${ref.id}/image`,ref.title,'loading="lazy"')}
     <h3>${e(ref.title)}</h3><p>${e(ref.family || ref.specimen.name)} · ${e(ref.fingerprint.swatch)}</p>
     <div class="actions">${link("Open specimen","#tile:"+ref.tile_id,"secondary","tiles")}${btn("Retire","reference-retire","ghost",null,`data-id="${ref.id}"`)}</div></article>`).join("")}</div>`:empty("Approve a visual reference from a specimen with a registered capture.",link("Open specimens","#collection","primary","tiles"))}`;
@@ -259,6 +291,16 @@ async function gatherTile(token=travel) {
   state.activity=activity.items;
   state.metrology=metrology.items;
   state.refs=refs.items;
+  const batch=state.tile?.batch;
+  if (batch) {
+    const index=await api("/api/batch-calibrations").catch(()=>null);
+    const listed=index?.items?.some(item=>item.batch===batch);
+    const found=listed?await api(`/api/batch-calibrations/${encodeURIComponent(batch)}`).catch(()=>null):null;
+    if (token!==travel) return;
+    state.batch=found&&found.batch?found:null;
+  } else {
+    state.batch=null;
+  }
 }
 
 async function route() {
@@ -278,8 +320,8 @@ async function route() {
     return;
   }
   if (hash==="references") {
-    const refs=await api("/api/library");
-    if (token===travel) {state.refs=refs.items;state.page="references";render();}
+    const [refs,batches]=await Promise.all([api("/api/library"),api("/api/batch-calibrations")]);
+    if (token===travel) {state.refs=refs.items;state.batches=batches.items;state.page="references";render();}
     return;
   }
   if (hash==="studies") {
@@ -477,6 +519,32 @@ function neutralForm() {
     numField("Linear target","target",0.18,0.08,0.8,0.01)+
     '<p class="soft">Target is a linear-image value. Sampling uses the unclipped center of the marked card.</p>',
     "Save balance",async data=>patchTile("/calibration","PUT",parseDatesAndNumbers(data,["target"]),"Neutral-card balance saved."));
+}
+
+async function batchForm() {
+  const batch=state.tile.batch;
+  if (!batch) throw Error("Give this specimen a batch or tray label first.");
+  const all=(await api("/api/specimens")).items.filter(item=>item.batch===batch);
+  const defaults=state.config.neutral_defaults||{target:0.18,tolerance:0.015};
+  const current=state.batch;
+  const rows=all.map(item=>`<label class="field check row"><input type="checkbox" name="tile_ids" value="${item.id}"${!current||current.members.some(member=>member.tile_id===item.id)?" checked":""}>
+    <span class="grow">${e(item.name)}</span></label>`).join("");
+  modal("Register batch gain set",`
+    <p class="notice">The desk registers one set of channel gains for ${e(batch)}. Every later reading of these plates uses it. Each plate's linear gray card must land within the target tolerance, and print pixels pushed out of range are excluded from color comparison.</p>
+    <div class="form-columns">${numField("Neutral target","target",current?.target ?? defaults.target,0.08,0.8,0.01)}
+    ${numField("Card tolerance","tolerance",current?.tolerance ?? defaults.tolerance,0.001,0.05,0.001)}</div>
+    <div class="divider-list scroll-list">${rows}</div>`,
+    "Register gains",async data=>{
+      const ids=data.getAll("tile_ids");
+      if (!ids.length) throw Error("Choose at least one plate for the batch gain set.");
+      state.batch=await api(`/api/batch-calibrations/${encodeURIComponent(batch)}`,{method:"PUT",body:{
+        ...parseDatesAndNumbers(data,["target","tolerance"]),tile_ids:ids,
+      }});
+      await gatherTile();
+      commitModal();
+      toast(`Batch gains registered for ${state.batch.passing_count} of ${state.batch.plate_count} plates.`);
+      render();
+    });
 }
 
 function refForm() {
@@ -699,6 +767,15 @@ async function doAction(name,target) {
     "draw-undo":()=>{drawPoints.pop();drawUpdate();},
     neutral:neutralForm,
     "neutral-clear":()=>patchTile("/calibration","DELETE",{},"Neutral-card balance cleared."),
+    "batch-register":batchForm,
+    "batch-clear":async ()=>{
+      const batch=state.tile.batch;
+      await api(`/api/batch-calibrations/${encodeURIComponent(batch)}`,{method:"DELETE"});
+      state.batch=null;
+      await gatherTile();
+      toast("Batch gain set cleared.");
+      render();
+    },
     "reference-add":refForm,
     "reference-retire":()=>{
       const ref=state.refs.find(item=>item.id===id);

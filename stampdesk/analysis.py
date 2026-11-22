@@ -10,10 +10,12 @@ from .art import (
     signed_overlay,
     stored_preview,
 )
+from .batchcal import approval_gate, measurement_batch
 from .color import (
     capture_basis,
     compare_reference,
     corrected_linear,
+    corrected_overflow,
     reference_fingerprint,
     reference_map,
     summarize_colors,
@@ -106,12 +108,23 @@ def support_digest(frame, area):
     }
 
 
-def reference_color_sample(store, tile, photo_id, chosen_region, apply_neutral):
+def batch_record(store, tile):
+    return store.batch_calibration(tile.get("batch"))
+
+
+def reference_color_sample(store, tile, photo_id, chosen_region, apply_neutral, record=None):
     frame = specimen_frame(store.blobs, tile, photo_id)
     region = active_region(tile, chosen_region)
     domain = region_domain(frame.extent, tile, region)
     valid = analysis_mask(frame, domain, minimum=80, allow_clipped=False)
-    linear, correction = corrected_linear(tile, frame, apply_neutral)
+    linear, correction = corrected_linear(tile, frame, apply_neutral, record)
+    if correction and correction.get("scope") == "batch":
+        _, _, reasons = approval_gate(tile, frame, domain, record)
+        if reasons:
+            raise InputError("This plate cannot be approved into the reference library: " + " ".join(reasons))
+        valid &= ~corrected_overflow(linear)
+        if np.count_nonzero(valid) < 80:
+            raise InputError("Too little of the selected print area remains after the batch gains.")
     return {
         "fingerprint": reference_fingerprint(linear, valid),
         "basis": capture_basis(tile, frame, correction),
@@ -119,13 +132,15 @@ def reference_color_sample(store, tile, photo_id, chosen_region, apply_neutral):
         "source": capture_provenance(frame),
         "specimen": specimen_provenance(tile),
         "annotated_digest": stored_preview(annotated_regions(frame, [region] if region else [], linear), store.blobs),
+        "support_pixels": int(np.count_nonzero(valid)),
     }
 
 
 def approve_reference(store, payload):
     fields = library_fields(payload)
     tile = store.tile(fields["tile_id"])
-    reference = reference_color_sample(store, tile, None, fields["region_id"], True)
+    record = batch_record(store, tile)
+    reference = reference_color_sample(store, tile, None, fields["region_id"], True, record)
     return store.add_reference({**fields, **reference})
 
 
@@ -172,6 +187,23 @@ def formula_scale(values, support, floor):
     return max(float(np.quantile(available, 0.97)), floor) if len(available) else floor
 
 
+def color_support(frame, area, linear, correction):
+    """Supported pixels for a color comparison under the active correction.
+
+    Batch gains are shared across plates, so a gain that serves one plate can
+    push another plate's ink above the representable range. Those overflowed
+    pixels cannot be compared and are dropped from the color support.
+    """
+    support = analysis_mask(frame, area, allow_clipped=False)
+    if correction and correction.get("scope") == "batch":
+        support = support & ~corrected_overflow(linear)
+        if np.count_nonzero(support) < 36:
+            raise InputError(
+                "Too little print area survives the batch gains to compare color on this plate."
+            )
+    return support
+
+
 def compute_single(store, tile, frame, region, area, linear, correction, params, reference):
     kind = params["kind"]
     options = params["options"]
@@ -187,9 +219,12 @@ def compute_single(store, tile, frame, region, area, linear, correction, params,
         metrics, image = operation(frame, area, linear, options)
         return metrics, image, None
     if kind == "color":
-        metrics, map_values = summarize_colors(linear, support, options["grid"])
-        scale = formula_scale(map_values, support, 6)
-        image = magnitude_overlay(frame, map_values, support, scale, source=linear, unknown=area & ~support)
+        color_mask = color_support(frame, area, linear, correction)
+        metrics, map_values = summarize_colors(linear, color_mask, options["grid"])
+        if correction and correction.get("scope") == "batch":
+            metrics["batch_overflow_pixels"] = int(np.count_nonzero(support) - np.count_nonzero(color_mask))
+        scale = formula_scale(map_values, color_mask, 6)
+        image = magnitude_overlay(frame, map_values, color_mask, scale, source=linear, unknown=area & ~color_mask)
         return metrics, image, theoretical_legend(kind, scale)
     if kind == "coverage":
         unrestricted = region_domain(frame.extent, tile)
@@ -214,7 +249,8 @@ def compute_single(store, tile, frame, region, area, linear, correction, params,
         image = profile_overlay(frame, metrics["endpoints"], options["band_pixels"], linear)
         return metrics, image, None
     if kind == "reference":
-        fingerprint = reference_fingerprint(linear, support)
+        color_mask = color_support(frame, area, linear, correction)
+        fingerprint = reference_fingerprint(linear, color_mask)
         basis = capture_basis(tile, frame, correction)
         metrics = compare_reference(fingerprint, reference["fingerprint"], basis, reference["basis"])
         metrics["reference_title"] = reference["title"]
@@ -222,8 +258,8 @@ def compute_single(store, tile, frame, region, area, linear, correction, params,
         metrics["reference_image"] = reference["annotated_digest"]
         metrics["reference_region"] = reference["region"]
         map_values = reference_map(linear, reference["fingerprint"])
-        scale = formula_scale(map_values, support, 12)
-        return metrics, magnitude_overlay(frame, map_values, support, scale), theoretical_legend(kind, scale)
+        scale = formula_scale(map_values, color_mask, 12)
+        return metrics, magnitude_overlay(frame, map_values, color_mask, scale), theoretical_legend(kind, scale)
     raise RuntimeError(f"Unsupported image measurement: {kind}.")
 
 
@@ -243,20 +279,23 @@ def compute_pair(tile, first, second, area, params):
     return metrics, image, theoretical_legend(kind, scale)
 
 
-def result_key(tile, params, reference):
+def result_key(tile, params, reference, record):
     return key_for({
         "analyzer_version": ANALYZER_VERSION,
         "params": params,
         "tile_id": tile["id"],
         "tile_version": tile["version"],
         "reference_version": reference["version"] if reference else None,
+        "batch_gains": record["gains"] if record else None,
+        "batch_updated_at": record["updated_at"] if record else None,
     })
 
 
 def evaluate(store, tile_id, payload):
     tile = store.tile(tile_id)
     params, reference = resolve_parameters(store, tile, payload)
-    cache_key = result_key(tile, params, reference)
+    record = batch_record(store, tile)
+    cache_key = result_key(tile, params, reference, record)
     cached = store.get_cached_result(cache_key)
     if cached:
         return cached
@@ -266,8 +305,15 @@ def evaluate(store, tile_id, payload):
     pair = specimen_frame(store.blobs, tile, params["comparison_id"]) if params["comparison_id"] else None
     correction = None
     linear = frame.linear
+    batch = None
     if pair is not None:
         metrics, picture, legend = compute_pair(tile, frame, pair, area, params)
+    elif record is not None:
+        # A registered batch gain set is binding: every reading of the batch
+        # uses it, so the per-reading neutral toggle cannot bypass it.
+        linear, _, batch = measurement_batch(store, tile, frame, area, record)
+        correction = corrected_linear(tile, frame, True, record)[1]
+        metrics, picture, legend = compute_single(store, tile, frame, region, area, linear, correction, params, reference)
     else:
         linear, correction = corrected_linear(tile, frame, params["apply_neutral"])
         metrics, picture, legend = compute_single(store, tile, frame, region, area, linear, correction, params, reference)
@@ -281,6 +327,7 @@ def evaluate(store, tile_id, payload):
         "legend": legend,
         "basis": capture_basis(tile, frame, correction),
         "support": support_digest(frame, area),
+        "batch_calibration": batch,
         "provenance": {
             "analyzer_version": ANALYZER_VERSION,
             "specimen": specimen_provenance(tile),
@@ -289,6 +336,7 @@ def evaluate(store, tile_id, payload):
             "region": region,
             "exclusions": [item for item in tile["regions"] if item["purpose"] == "ignore"],
             "neutral_card": correction,
+            "batch_calibration": batch,
             "reference": {
                 "id": reference["id"],
                 "version": reference["version"],

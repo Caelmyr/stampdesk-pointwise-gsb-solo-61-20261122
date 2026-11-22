@@ -32,6 +32,8 @@ def comparable_signature(result):
         "photo_role": basis["photo_role"],
         "synthetic": basis["synthetic"],
         "neutral_target": basis["neutral_target"],
+        "correction_scope": basis.get("correction_scope"),
+        "batch": basis.get("batch"),
         "source_space": basis["source_space"],
     }
     if mode == "coverage":
@@ -56,7 +58,9 @@ def group_label(result, group_by):
 def capture_note(differences):
     if not differences:
         return "Selected measurements use the same lighting labels and method settings."
-    return "Groups mix " + ", ".join(differences) + ". Use comparisons as descriptive image observations."
+    renamed = [item.replace("correction scope", "neutral correction scope").replace("batch", "batch gain set")
+               for item in differences]
+    return "Groups mix " + ", ".join(renamed) + ". Use comparisons as descriptive image observations."
 
 
 def trial_entry(record, selector, group_by):
